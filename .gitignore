@@ -1,0 +1,6 @@
+# host build output
+/host/KickSync
+/host/KickSync.exe
+*.o
+*.kstmp
+__pycache__/
