@@ -3,6 +3,8 @@
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 KF=${1:-$HERE/KickSync}
+# DEFNAME_DIR: where the default output name is expected, relative to the
+# run directory (the Hollywood version writes it next to the input zip)
 PORT=${PORT:-6899}
 T=$(mktemp -d)
 trap 'kill $MOCK 2>/dev/null; rm -rf "$T"' EXIT
@@ -90,7 +92,7 @@ check "same modules, other lines -> kept"   sh -c 'grep "^Kickstart/Kicklayout "
 
 mkdir run && cd run
 "$KF" "127.0.0.1:$PORT" ../Kickstart.zip > /dev/null 2>&1
-check "default name Kickstart_<date>.zip"   test -f "Kickstart_$(date +%Y-%m-%d).zip"
+check "default name Kickstart_<date>.zip"   test -f "${DEFNAME_DIR:-.}/Kickstart_$(date +%Y-%m-%d).zip"
 "$KF" "127.0.0.1:$PORT" ../Kickstart.zip > /dev/null 2>&1
 check "refuses to overwrite"                test $? -eq 1
 "$KF" -f "127.0.0.1:$PORT" ../Kickstart.zip > /dev/null 2>&1

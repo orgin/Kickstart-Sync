@@ -1,0 +1,1435 @@
+/*
+** kicksync.hws - KickSync for Hollywood
+**
+** Updates a Kickstart.zip (as used to boot AmigaOS 4 under QEMU with BBoot)
+** with newer Kickstart modules from the AmigaOS 4 guest. The guest runs the
+** KickServ commodity, which serves SYS:Kickstart over TCP (port 6800).
+**
+** This is a port of the C library host/kicksync.c from Kickstart Sync
+** (https://github.com/orgin/Kickstart-Sync): same protocol, same rules,
+** same report. Include it with
+**
+**     @INCLUDE "kicksync.hws"
+**
+** and call KickSync.UpdateZip() (see the README in this folder).
+**
+** Requirements: Hollywood 9.0 or newer, and 7-Zip (7z / 7z.exe), which is
+** used to unpack the zip entries and to deflate the updated ones. Hollywood
+** has no raw deflate support of its own. Everything else (talking to
+** KickServ, reading $VER strings, the version rules, assembling the new
+** zip byte for byte) is plain Hollywood.
+**
+** Rules (the same as the C version):
+**   - Each zip entry is looked up on the Amiga by its file name without the
+**     directory part, ignoring upper/lower case like AmigaOS does.
+**   - The Amiga copy is taken unless both copies carry a $VER: version and
+**     the Amiga version is not newer. So a missing $VER: on either side
+**     means the Amiga copy is taken - unless it is byte for byte the same
+**     as the zip copy (checked whenever the sizes match).
+**   - Kicklayout is never replaced (whatever its $VER: says): it lists the
+**     modules for one particular machine. If the Amiga copy differs, the
+**     report lists the MODULE lines found in only one of the two copies.
+**     Set TakeKicklayout to take the Amiga copy anyway.
+**   - Entries keep the exact name (and case) from the original zip and the
+**     original order. Unchanged entries are copied byte for byte.
+**
+** Strings that hold file data are handled as raw bytes (#ENCODING_RAW), so
+** the script works whatever default string encoding the program uses.
+** Names and $VER strings are passed on as the bytes the Amiga sent
+** (ISO-8859-1); convert them with ConvertStr() before showing non-ASCII
+** text in a UTF-8 GUI.
+**
+** Public domain (Unlicense), like the rest of Kickstart Sync.
+*/
+
+; ------------------------------------------------------------------------
+; Constants
+
+; status codes (negative values are errors)
+Const #KSYNC_OK = 0
+Const #KSYNC_NOT_FOUND = 1          ; Info()/Get(): no such file on the Amiga
+Const #KSYNC_ERR_ARGS = -1          ; invalid options
+Const #KSYNC_ERR_CONNECT = -2       ; cannot connect / resolve host
+Const #KSYNC_ERR_NET = -3           ; send/receive failed, timeout
+Const #KSYNC_ERR_PROTOCOL = -4      ; unexpected reply from the server
+Const #KSYNC_ERR_SERVER = -5        ; server answered ERR
+Const #KSYNC_ERR_ZIP = -6           ; zip damaged or unsupported
+Const #KSYNC_ERR_IO = -7            ; local file could not be read/written
+Const #KSYNC_ERR_EXISTS = -8        ; output exists and Force is not set
+Const #KSYNC_ERR_7ZIP = -10         ; 7-Zip missing or failed
+
+; what happened to an entry (report.action)
+Const #KSYNC_ACT_UPDATED = 0            ; Amiga copy put into the new zip
+Const #KSYNC_ACT_SAME = 1               ; same version or identical bytes
+Const #KSYNC_ACT_KEPT_ZIP_NEWER = 2     ; zip copy has a higher version
+Const #KSYNC_ACT_KEPT_NOT_ON_AMIGA = 3  ; no file of that name on the Amiga
+Const #KSYNC_ACT_KEPT_KICKLAYOUT = 4    ; Kicklayout differs, zip copy kept
+
+; why an entry was updated (report.reason)
+Const #KSYNC_REASON_NONE = 0
+Const #KSYNC_REASON_NEWER = 1               ; Amiga version is higher
+Const #KSYNC_REASON_NO_AMIGA_VERSION = 2    ; Amiga file has no $VER:
+Const #KSYNC_REASON_NO_ZIP_VERSION = 3      ; zip entry has no $VER:
+Const #KSYNC_REASON_TAKE_KICKLAYOUT = 4     ; TakeKicklayout was set
+
+Const #KS_LINE_MAX = 4096
+Const #KS_NAME_MAX = 256
+Const #KS_VER_CHARS = 200
+Const #KS_MAX_FILE = 268435456      ; sanity limit for one module (256 MB)
+Const #KS_SIG_LOCAL = $04034B50
+Const #KS_SIG_CENTRAL = $02014B50
+Const #KS_SIG_END = $06054B50
+
+KickSync = {}
+KickSync.Version = "1.1"
+KickSync.DefaultPort = 6800
+
+; ------------------------------------------------------------------------
+; Byte helpers. Offsets start at 0, like Hollywood's string positions.
+
+Function p_KS_Len(s$)
+	Return(ByteLen(s$))
+EndFunction
+
+; n bytes from pos (n = -1: the rest). Never reads outside the string.
+Function p_KS_Mid(s$, pos, n)
+	Local len = ByteLen(s$)
+	If pos >= len Or n = 0 Then Return("")
+	If n < 0 Or pos + n > len Then n = len - pos
+	Return(MidStr(s$, pos, n, #ENCODING_RAW))
+EndFunction
+
+; Position of sub$ at or after start, or -1.
+Function p_KS_Find(s$, sub$, start)
+	If start >= ByteLen(s$) Then Return(-1)
+	Return(FindStr(s$, sub$, True, start, #ENCODING_RAW))
+EndFunction
+
+; Makes a CRC unsigned, in case a function returns it as a signed value.
+Function p_KS_U32(v)
+	If v < 0 Then v = v + 4294967296
+	Return(v)
+EndFunction
+
+Function p_KS_R16(s$, o)
+	Return(ByteAsc(s$, o) + ByteAsc(s$, o + 1) * 256)
+EndFunction
+
+Function p_KS_R32(s$, o)
+	Return(p_KS_R16(s$, o) + p_KS_R16(s$, o + 2) * 65536)
+EndFunction
+
+Function p_KS_W16(v)
+	Return(ByteChr(v % 256) .. ByteChr((v \ 256) % 256))
+EndFunction
+
+; Written with 16-bit halves, so values above $7FFFFFFF (CRCs) are safe.
+Function p_KS_W32(v)
+	v = p_KS_U32(v)
+	Local hi = Int(v / 65536)
+	Return(p_KS_W16(v - hi * 65536) .. p_KS_W16(hi))
+EndFunction
+
+Function p_KS_IsDigit(c)
+	Return(c >= 48 And c <= 57)
+EndFunction
+
+; AmigaOS compares names case-insensitively using ISO-8859-1.
+Function p_KS_Lower(s$)
+	Return(LowerStr(s$, #ENCODING_ISO8859_1))
+EndFunction
+
+Function KickSync.NameEqual(a$, b$)
+	Return(p_KS_Lower(a$) = p_KS_Lower(b$))
+EndFunction
+
+; File name without the directory part of a zip entry name.
+Function p_KS_BaseName(path$)
+	Local p = p_KS_Find(path$, "/", 0)
+	Local last = -1
+	While p >= 0
+		last = p
+		p = p_KS_Find(path$, "/", p + 1)
+	Wend
+	Return(p_KS_Mid(path$, last + 1, -1))
+EndFunction
+
+; Digits only (like C's strtoul with nothing left over). Returns ok, value.
+Function p_KS_ParseULong(s$)
+	Local n = p_KS_Len(s$)
+	If n = 0 Or n > 15 Then Return(False, 0)
+	Local v = 0
+	For Local i = 0 To n - 1
+		Local c = ByteAsc(s$, i)
+		If Not p_KS_IsDigit(c) Then Return(False, 0)
+		v = v * 10 + (c - 48)
+	Next
+	Return(True, v)
+EndFunction
+
+; Splits a reply at TABs into at most max fields (the last field keeps any
+; further TABs). Returns the fields (index 0 ...) and their number.
+Function p_KS_SplitFields(line$, max)
+	Local f = {}
+	Local n = 0
+	Local start = 0
+	While n < max - 1
+		Local t = p_KS_Find(line$, "\t", start)
+		If t < 0 Then Break
+		f[n] = p_KS_Mid(line$, start, t - start)
+		n = n + 1
+		start = t + 1
+	Wend
+	f[n] = p_KS_Mid(line$, start, -1)
+	Return(f, n + 1)
+EndFunction
+
+Function p_KS_Call(f, a, b, c, d)
+	If GetType(f) = #FUNCTION Then f(a, b, c, d)
+EndFunction
+
+; ------------------------------------------------------------------------
+; Dates
+
+; days since 1970-01-01 -> y, m, d (proleptic Gregorian)
+Function p_KS_CivilFromDays(z)
+	z = z + 719468
+	Local era
+	If z >= 0
+		era = Int(z / 146097)
+	Else
+		era = Int((z - 146096) / 146097)
+	EndIf
+	Local yoe = z - era * 146097
+	Local yy = Int((yoe - Int(yoe / 1460) + Int(yoe / 36524) - Int(yoe / 146096)) / 365)
+	Local doy = yoe - (365 * yy + Int(yy / 4) - Int(yy / 100))
+	Local mp = Int((5 * doy + 2) / 153)
+	Local d = doy - Int((153 * mp + 2) / 5) + 1
+	Local m
+	If mp < 10
+		m = mp + 3
+	Else
+		m = mp - 9
+	EndIf
+	Local y = yy + era * 400
+	If m <= 2 Then y = y + 1
+	Return(y, m, d)
+EndFunction
+
+; Amiga date (seconds since 1978-01-01, local time) -> y, m, d, h, mi, s
+Function KickSync.AmigaDate(secs)
+	Local days = Int(secs / 86400)
+	Local rem = secs - days * 86400
+	Local y, m, d = p_KS_CivilFromDays(days + 2922)
+	Return(y, m, d, Int(rem / 3600), Int(rem / 60) % 60, rem % 60)
+EndFunction
+
+; Amiga date -> MS-DOS time and date words for the zip headers
+Function p_KS_AmigaToDos(secs)
+	Local y, mo, d, h, mi, s = KickSync.AmigaDate(secs)
+	If y < 1980
+		y = 1980
+		mo = 1
+		d = 1
+		h = 0
+		mi = 0
+		s = 0
+	EndIf
+	If y > 2107 Then y = 2107
+	Return(h * 2048 + mi * 32 + (s \ 2), (y - 1980) * 512 + mo * 32 + d)
+EndFunction
+
+; "Kickstart_<YYYY-MM-DD>.zip" using today's local date
+Function KickSync.DefaultOutputName()
+	Return("Kickstart_" .. PadNum(GetDateNum(#DATEYEAR), 4) .. "-" ..
+		PadNum(GetDateNum(#DATEMONTH), 2) .. "-" ..
+		PadNum(GetDateNum(#DATEDAY), 2) .. ".zip")
+EndFunction
+
+; ------------------------------------------------------------------------
+; Versions. A version is a table {n, part}: n = 0 means "no version",
+; otherwise 2 or 3 numbers in part[0] ... part[2] (54.30 or 1.2.3).
+
+Function KickSync.NewVersion()
+	Local v = {n = 0, part = {}}
+	v.part[0] = 0
+	v.part[1] = 0
+	v.part[2] = 0
+	Return(v)
+EndFunction
+
+; Returns found, text after the first "$VER:" (at most 200 characters,
+; control characters turned into spaces, trailing spaces removed).
+Function KickSync.FindVerString(data$)
+	Local i = p_KS_Find(data$, "$VER:", 0)
+	If i < 0 Then Return(False, "")
+	Local n = p_KS_Len(data$)
+	Local j = i + 5
+	While j < n
+		If ByteAsc(data$, j) <> 32 Then Break
+		j = j + 1
+	Wend
+	Local stop = Min(j + #KS_VER_CHARS, n)
+	Local chars = {}
+	Local o = 0
+	For Local k = j To stop - 1
+		Local c = ByteAsc(data$, k)
+		If c = 0 Or c = 10 Or c = 13 Then Break
+		If c < 32 Then c = 32
+		chars[o] = ByteChr(c)
+		o = o + 1
+	Next
+	While o > 0
+		If chars[o - 1] <> " " Then Break
+		o = o - 1
+	Wend
+	If o = 0 Then Return(True, "")
+	Return(True, Concat(chars, "", 0, o - 1))
+EndFunction
+
+; Is s$ exactly "digits.digits[.digits]"? Returns ok, version.
+Function p_KS_ParseVerToken(s$)
+	Local n = p_KS_Len(s$)
+	Local v = KickSync.NewVersion()
+	Local i = 0
+	While v.n < 3
+		Local num = 0
+		Local start = i
+		While i < n
+			Local c = ByteAsc(s$, i)
+			If Not p_KS_IsDigit(c) Then Break
+			If num < 100000000 Then num = num * 10 + (c - 48)
+			i = i + 1
+		Wend
+		If i = start Then Return(False, Nil)
+		v.part[v.n] = num
+		v.n = v.n + 1
+		If i = n Then Break
+		If ByteAsc(s$, i) <> 46 Then Return(False, Nil)
+		i = i + 1
+	Wend
+	If i <> n Or v.n < 2 Then Return(False, Nil)
+	Return(True, v)
+EndFunction
+
+; "exec.library 54.30 (1.2.2021)" -> 54.30. Returns the version (n = 0 if
+; none was found).
+Function KickSync.ParseVersion(vs$)
+	Local none = KickSync.NewVersion()
+	Local len = p_KS_Len(vs$)
+	If len = 0 Then Return(none)
+
+	; split at spaces and TABs (at most 64 tokens, like the C version)
+	Local tok = {}
+	Local ntok = 0
+	Local p = 0
+	While p < len And ntok < 64
+		While p < len
+			Local c = ByteAsc(vs$, p)
+			If c <> 32 And c <> 9 Then Break
+			p = p + 1
+		Wend
+		If p >= len Then Break
+		Local start = p
+		While p < len
+			Local c = ByteAsc(vs$, p)
+			If c = 32 Or c = 9 Then Break
+			p = p + 1
+		Wend
+		tok[ntok] = p_KS_Mid(vs$, start, p - start)
+		ntok = ntok + 1
+	Wend
+
+	; skip the module name, then the first "x.y" token; then the name itself
+	For Local i = 1 To ntok - 1
+		Local ok, v = p_KS_ParseVerToken(tok[i])
+		If ok Then Return(v)
+	Next
+	If ntok > 0
+		Local ok, v = p_KS_ParseVerToken(tok[0])
+		If ok Then Return(v)
+	EndIf
+
+	; last resort: the first "digits.digits" anywhere
+	For Local i = 0 To len - 1
+		Local c = ByteAsc(vs$, i)
+		Local prevdigit = False
+		If i > 0 Then prevdigit = p_KS_IsDigit(ByteAsc(vs$, i - 1))
+		If p_KS_IsDigit(c) And Not prevdigit
+			Local q = i
+			Local a = 0
+			While q < len
+				Local d = ByteAsc(vs$, q)
+				If Not p_KS_IsDigit(d) Then Break
+				a = a * 10 + (d - 48)
+				q = q + 1
+			Wend
+			If q + 1 < len
+				If ByteAsc(vs$, q) = 46 And p_KS_IsDigit(ByteAsc(vs$, q + 1))
+					Local b = 0
+					q = q + 1
+					While q < len
+						Local d = ByteAsc(vs$, q)
+						If Not p_KS_IsDigit(d) Then Break
+						b = b * 10 + (d - 48)
+						q = q + 1
+					Wend
+					Local v = KickSync.NewVersion()
+					v.n = 2
+					v.part[0] = a
+					v.part[1] = b
+					Return(v)
+				EndIf
+			EndIf
+		EndIf
+	Next
+	Return(none)
+EndFunction
+
+; <0, 0, >0. A missing version compares lower than any version.
+Function KickSync.CompareVersion(a, b)
+	For Local i = 0 To Min(a.n, b.n) - 1
+		If a.part[i] <> b.part[i]
+			If a.part[i] < b.part[i] Then Return(-1)
+			Return(1)
+		EndIf
+	Next
+	If a.n = b.n Then Return(0)
+	If a.n < b.n Then Return(-1)
+	Return(1)
+EndFunction
+
+; "54.30", "1.2.3" or "?" for no version
+Function KickSync.FormatVersion(v)
+	If v.n = 0 Then Return("?")
+	If v.n = 2 Then Return(v.part[0] .. "." .. v.part[1])
+	Return(v.part[0] .. "." .. v.part[1] .. "." .. v.part[2])
+EndFunction
+
+; ------------------------------------------------------------------------
+; "host", "host:port", "1.2.3.4:port", "[::1]:port"
+; Returns status, host$, port.
+
+Function KickSync.ParseHostPort(s$)
+	Local host$ = s$
+	Local pstr$ = ""
+	Local haveport = False
+	If s$ = "" Then Return(#KSYNC_ERR_ARGS, "", 0)
+	Local colon = p_KS_Find(s$, ":", 0)
+	If ByteAsc(s$, 0) = 91                          ; "[ipv6]:port"
+		Local rb = p_KS_Find(s$, "]", 0)
+		If rb < 0 Then Return(#KSYNC_ERR_ARGS, "", 0)
+		host$ = p_KS_Mid(s$, 1, rb - 1)
+		Local rest$ = p_KS_Mid(s$, rb + 1, -1)
+		If rest$ <> ""
+			If ByteAsc(rest$, 0) <> 58 Then Return(#KSYNC_ERR_ARGS, "", 0)
+			haveport = True
+			pstr$ = p_KS_Mid(rest$, 1, -1)
+		EndIf
+	ElseIf colon >= 0 And p_KS_Find(s$, ":", colon + 1) < 0    ; "host:port"
+		host$ = p_KS_Mid(s$, 0, colon)
+		haveport = True
+		pstr$ = p_KS_Mid(s$, colon + 1, -1)
+	EndIf                                           ; else host or bare IPv6
+	If host$ = "" Or p_KS_Len(host$) >= 256 Then Return(#KSYNC_ERR_ARGS, "", 0)
+	If Not haveport Then Return(#KSYNC_OK, host$, KickSync.DefaultPort)
+	Local ok, port = p_KS_ParseULong(pstr$)
+	If Not ok Or port <= 0 Or port > 65535 Then Return(#KSYNC_ERR_ARGS, "", 0)
+	Return(#KSYNC_OK, host$, port)
+EndFunction
+
+; ------------------------------------------------------------------------
+; Talking to KickServ
+;
+; Protocol: text lines ending with LF, fields separated by TAB.
+;   (connect)    -> KICKSERV<TAB>1   (or ERR<TAB>access denied / busy)
+;   INFO <name>  -> OK<TAB><size><TAB><date><TAB><$VER string> | ERR<TAB><msg>
+;   GET <name>   -> OK<TAB><size>, then exactly <size> raw bytes | ERR<TAB><msg>
+;   LIST         -> OK, one <size><TAB><date><TAB><name><TAB><$VER> line
+;                   per file, then "."
+;   QUIT         -> BYE
+; <date> is seconds since 1978-01-01 00:00 in Amiga local time.
+;
+; A connection is a table: id (Hollywood network id), buf/pos (bytes
+; received but not used yet), err (message for the last failure).
+
+Function KickSync.ConnError(c)
+	If c = Nil Then Return("no connection")
+	Return(c.err)
+EndFunction
+
+; Waits for the next piece of data. Returns status, data$.
+Function p_KS_Recv(c)
+	Local t0 = GetTimer(c.timer)
+	Repeat
+		Local err, data$, count = ?ReceiveData(c.id, #RECEIVEALL, False)
+		If err <> #ERR_NONE
+			c.err = "receive failed: " .. GetErrorName(err)
+			Return(#KSYNC_ERR_NET, "")
+		EndIf
+		If count > 0 Then Return(#KSYNC_OK, data$)
+		If GetTimer(c.timer) - t0 > c.timeout
+			c.err = "receive timed out (connection lost?)"
+			Return(#KSYNC_ERR_NET, "")
+		EndIf
+		Wait(10, #MILLISECONDS)
+	Forever
+EndFunction
+
+; Returns status, line$ (without CR/LF).
+Function p_KS_ReadLine(c)
+	Repeat
+		Local nl = p_KS_Find(c.buf, "\n", c.pos)
+		If nl >= 0
+			Local line$ = p_KS_Mid(c.buf, c.pos, nl - c.pos)
+			c.pos = nl + 1
+			If c.pos > 65536
+				c.buf = p_KS_Mid(c.buf, c.pos, -1)
+				c.pos = 0
+			EndIf
+			Local n = p_KS_Len(line$)
+			If n > 0
+				If ByteAsc(line$, n - 1) = 13 Then line$ = p_KS_Mid(line$, 0, n - 1)
+			EndIf
+			Return(#KSYNC_OK, line$)
+		EndIf
+		If p_KS_Len(c.buf) - c.pos >= #KS_LINE_MAX
+			c.err = "reply line too long"
+			Return(#KSYNC_ERR_PROTOCOL, "")
+		EndIf
+		Local r, data$ = p_KS_Recv(c)
+		If r <> #KSYNC_OK Then Return(r, "")
+		c.buf = p_KS_Mid(c.buf, c.pos, -1) .. data$
+		c.pos = 0
+	Forever
+EndFunction
+
+; Returns status, exactly n bytes.
+Function p_KS_ReadExact(c, n)
+	Local avail = p_KS_Len(c.buf) - c.pos
+	If avail >= n
+		Local d$ = p_KS_Mid(c.buf, c.pos, n)
+		c.pos = c.pos + n
+		Return(#KSYNC_OK, d$)
+	EndIf
+	Local parts = {}
+	parts[0] = p_KS_Mid(c.buf, c.pos, -1)
+	Local np = 1
+	Local got = avail
+	c.buf = ""
+	c.pos = 0
+	While got < n
+		Local r, data$ = p_KS_Recv(c)
+		If r <> #KSYNC_OK Then Return(r, "")
+		Local len = p_KS_Len(data$)
+		If got + len > n
+			parts[np] = p_KS_Mid(data$, 0, n - got)
+			c.buf = p_KS_Mid(data$, n - got, -1)
+			len = n - got
+		Else
+			parts[np] = data$
+		EndIf
+		np = np + 1
+		got = got + len
+	Wend
+	Return(#KSYNC_OK, Concat(parts, "", 0, np - 1))
+EndFunction
+
+Function p_KS_Send(c, cmd$, arg$)
+	Local line$ = cmd$ .. "\n"
+	If arg$ <> Nil
+		If p_KS_Find(arg$, "\n", 0) >= 0 Or p_KS_Find(arg$, "\r", 0) >= 0
+			c.err = "invalid file name"
+			Return(#KSYNC_ERR_ARGS)
+		EndIf
+		If p_KS_Len(arg$) >= #KS_NAME_MAX
+			c.err = "file name too long"
+			Return(#KSYNC_ERR_ARGS)
+		EndIf
+		line$ = cmd$ .. " " .. arg$ .. "\n"
+	EndIf
+	While line$ <> ""
+		Local err, count = ?SendData(c.id, line$)
+		If err <> #ERR_NONE Or count <= 0
+			c.err = "send failed"
+			Return(#KSYNC_ERR_NET)
+		EndIf
+		line$ = p_KS_Mid(line$, count, -1)
+	Wend
+	Return(#KSYNC_OK)
+EndFunction
+
+; Reads a reply line and handles ERR. Returns status, fields, count.
+Function p_KS_ReadReply(c, maxf)
+	Local r, line$ = p_KS_ReadLine(c)
+	If r <> #KSYNC_OK Then Return(r, Nil, 0)
+	Local f, nf = p_KS_SplitFields(line$, maxf)
+	If f[0] = "ERR"
+		Local msg$ = "error"
+		If nf > 1 Then msg$ = f[1]
+		c.err = msg$
+		If msg$ = "not found" Then Return(#KSYNC_NOT_FOUND, f, nf)
+		Return(#KSYNC_ERR_SERVER, f, nf)
+	EndIf
+	If f[0] <> "OK"
+		c.err = "unexpected reply \"" .. p_KS_Mid(f[0], 0, 60) .. "\""
+		Return(#KSYNC_ERR_PROTOCOL, f, nf)
+	EndIf
+	Return(#KSYNC_OK, f, nf)
+EndFunction
+
+; Sends QUIT and closes the connection (safe to call more than once).
+Function KickSync.Close(c)
+	If c = Nil Then Return
+	Local id = RawGet(c, "id")
+	If id <> Nil
+		Local e1 = ?SendData(id, "QUIT\n")
+		Local e2 = ?CloseConnection(id)
+		c.id = Nil
+	EndIf
+	Local timer = RawGet(c, "timer")
+	If timer <> Nil
+		StopTimer(timer)
+		c.timer = Nil
+	EndIf
+EndFunction
+
+; Connects and reads the greeting. timeout is in milliseconds (0 or Nil:
+; 15 seconds). Returns the connection, or Nil and an error message.
+Function KickSync.Connect(host$, port, timeout)
+	If host$ = Nil Then host$ = ""
+	If port = Nil Then port = KickSync.DefaultPort
+	If host$ = "" Or port <= 0 Or port > 65535 Then Return(Nil, "invalid host or port")
+	If timeout = Nil Then timeout = 0
+	If timeout <= 0 Then timeout = 15000
+
+	Local err, id = ?OpenConnection(Nil, host$, port)
+	If err <> #ERR_NONE
+		Return(Nil, "cannot connect to " .. host$ .. ":" .. port .. ": " .. GetErrorName(err))
+	EndIf
+	Local c = {id = id, buf = "", pos = 0, err = "", timeout = timeout}
+	c.timer = StartTimer(Nil)
+
+	Local r, line$ = p_KS_ReadLine(c)
+	If r <> #KSYNC_OK
+		Local msg$ = host$ .. ":" .. port .. ": " .. c.err
+		KickSync.Close(c)
+		Return(Nil, msg$)
+	EndIf
+	Local f, nf = p_KS_SplitFields(line$, 4)
+	If f[0] = "ERR"
+		Local why$ = ""
+		If nf > 1 Then why$ = f[1]
+		KickSync.Close(c)
+		Return(Nil, "server refused connection: " .. why$)
+	EndIf
+	If f[0] <> "KICKSERV"
+		KickSync.Close(c)
+		Return(Nil, host$ .. ":" .. port .. " is not a KickServ server")
+	EndIf
+	Return(c, "")
+EndFunction
+
+; Returns status (#KSYNC_OK, #KSYNC_NOT_FOUND or an error) and an info
+; table {name, size, date, ver}. info.name is the name asked for.
+Function KickSync.Info(c, name$)
+	Local info = {name = name$, size = 0, date = 0, ver = ""}
+	Local r = p_KS_Send(c, "INFO", name$)
+	If r <> #KSYNC_OK Then Return(r, info)
+	Local f, nf
+	r, f, nf = p_KS_ReadReply(c, 4)
+	If r <> #KSYNC_OK Then Return(r, info)
+	Local ok1, size = p_KS_ParseULong("")
+	Local ok2, date = p_KS_ParseULong("")
+	If nf >= 3
+		ok1, size = p_KS_ParseULong(f[1])
+		ok2, date = p_KS_ParseULong(f[2])
+	EndIf
+	If Not (ok1 And ok2)
+		c.err = "malformed INFO reply"
+		Return(#KSYNC_ERR_PROTOCOL, info)
+	EndIf
+	info.size = size
+	info.date = date
+	If nf > 3 Then info.ver = p_KS_Mid(f[3], 0, #KS_VER_CHARS)
+	Return(#KSYNC_OK, info)
+EndFunction
+
+; Returns status and the file's contents.
+Function KickSync.Get(c, name$)
+	Local r = p_KS_Send(c, "GET", name$)
+	If r <> #KSYNC_OK Then Return(r, "")
+	Local f, nf
+	r, f, nf = p_KS_ReadReply(c, 3)
+	If r <> #KSYNC_OK Then Return(r, "")
+	Local ok, size = p_KS_ParseULong("")
+	If nf >= 2 Then ok, size = p_KS_ParseULong(f[1])
+	If Not ok Or size > #KS_MAX_FILE
+		c.err = "malformed GET reply"
+		Return(#KSYNC_ERR_PROTOCOL, "")
+	EndIf
+	If size = 0 Then Return(#KSYNC_OK, "")
+	Local data$
+	r, data$ = p_KS_ReadExact(c, size)
+	Return(r, data$)
+EndFunction
+
+; All files in the served directory. Returns status, a list of info tables
+; {name, size, date, ver} (index 0 ...) and the number of files.
+Function KickSync.List(c)
+	Local files = {}
+	Local n = 0
+	Local r = p_KS_Send(c, "LIST", Nil)
+	If r <> #KSYNC_OK Then Return(r, files, 0)
+	Local f, nf
+	r, f, nf = p_KS_ReadReply(c, 5)
+	If r = #KSYNC_NOT_FOUND Then r = #KSYNC_ERR_SERVER
+	If r <> #KSYNC_OK Then Return(r, files, 0)
+	Repeat
+		Local line$
+		r, line$ = p_KS_ReadLine(c)
+		If r <> #KSYNC_OK Then Return(r, {}, 0)
+		If line$ = "." Then Break
+		f, nf = p_KS_SplitFields(line$, 5)
+		Local ok1, size = p_KS_ParseULong("")
+		Local ok2, date = p_KS_ParseULong("")
+		If nf >= 3
+			ok1, size = p_KS_ParseULong(f[0])
+			ok2, date = p_KS_ParseULong(f[1])
+		EndIf
+		If Not (ok1 And ok2)
+			c.err = "malformed LIST line"
+			Return(#KSYNC_ERR_PROTOCOL, {}, 0)
+		EndIf
+		Local fi = {name = p_KS_Mid(f[2], 0, #KS_NAME_MAX - 1), size = size, date = date, ver = ""}
+		If nf > 3 Then fi.ver = p_KS_Mid(f[3], 0, #KS_VER_CHARS)
+		files[n] = fi
+		n = n + 1
+	Forever
+	Return(#KSYNC_OK, files, n)
+EndFunction
+
+; ------------------------------------------------------------------------
+; Zip reading. The whole zip is read into a string; entries keep their
+; header fields, and dataoff points at their compressed data in z.buf.
+
+Function p_KS_ZipParse(b$, path$)
+	Local size = p_KS_Len(b$)
+	Local z = {buf = b$, n = 0, e = {}, comment = ""}
+	Local eocd = -1
+	If size >= 22
+		Local lo = Max(size - 22 - 65535, 0)
+		For Local i = size - 22 To lo Step -1
+			If p_KS_R32(b$, i) = #KS_SIG_END
+				If i + 22 + p_KS_R16(b$, i + 20) = size
+					eocd = i
+					Break
+				EndIf
+			EndIf
+		Next
+	EndIf
+	If eocd < 0 Then Return(#KSYNC_ERR_ZIP, z, path$ .. " is not a zip file")
+	If p_KS_R16(b$, eocd + 4) <> 0 Or p_KS_R16(b$, eocd + 6) <> 0
+		Return(#KSYNC_ERR_ZIP, z, path$ .. ": multi-part zip files are not supported")
+	EndIf
+	Local nent = p_KS_R16(b$, eocd + 10)
+	Local cdsize = p_KS_R32(b$, eocd + 12)
+	Local cdoff = p_KS_R32(b$, eocd + 16)
+	z.comment = p_KS_Mid(b$, eocd + 22, p_KS_R16(b$, eocd + 20))
+	If nent = 65535 Or cdoff = 4294967295
+		Return(#KSYNC_ERR_ZIP, z, path$ .. ": ZIP64 archives are not supported")
+	EndIf
+	If cdoff + cdsize > eocd Then Return(#KSYNC_ERR_ZIP, z, path$ .. ": damaged central directory")
+
+	Local damaged$ = path$ .. ": damaged zip file"
+	Local p = cdoff
+	For Local i = 0 To nent - 1
+		If p + 46 > eocd Then Return(#KSYNC_ERR_ZIP, z, damaged$)
+		If p_KS_R32(b$, p) <> #KS_SIG_CENTRAL Then Return(#KSYNC_ERR_ZIP, z, damaged$)
+		Local e = {}
+		e.madeby = p_KS_R16(b$, p + 4)
+		e.needed = p_KS_R16(b$, p + 6)
+		e.flags = p_KS_R16(b$, p + 8)
+		e.method = p_KS_R16(b$, p + 10)
+		e.dtime = p_KS_R16(b$, p + 12)
+		e.ddate = p_KS_R16(b$, p + 14)
+		e.crc = p_KS_R32(b$, p + 16)
+		e.csize = p_KS_R32(b$, p + 20)
+		e.usize = p_KS_R32(b$, p + 24)
+		Local nlen = p_KS_R16(b$, p + 28)
+		Local xlen = p_KS_R16(b$, p + 30)
+		Local clen = p_KS_R16(b$, p + 32)
+		e.intattr = p_KS_R16(b$, p + 36)
+		e.extattr = p_KS_R32(b$, p + 38)
+		e.localoff = p_KS_R32(b$, p + 42)
+		If p + 46 + nlen + xlen + clen > eocd Then Return(#KSYNC_ERR_ZIP, z, damaged$)
+		e.name = p_KS_Mid(b$, p + 46, nlen)
+		If p_KS_Find(e.name, "\0", 0) >= 0 Then Return(#KSYNC_ERR_ZIP, z, damaged$)
+		e.cextra = p_KS_Mid(b$, p + 46 + nlen, xlen)
+		e.comment = p_KS_Mid(b$, p + 46 + nlen + xlen, clen)
+		p = p + 46 + nlen + xlen + clen
+
+		If e.csize = 4294967295 Or e.usize = 4294967295 Or e.localoff = 4294967295
+			Return(#KSYNC_ERR_ZIP, z, path$ .. ": ZIP64 entries are not supported")
+		EndIf
+		If e.flags & 1
+			Return(#KSYNC_ERR_ZIP, z, path$ .. ": encrypted entries are not supported (" .. e.name .. ")")
+		EndIf
+		If e.method <> 0 And e.method <> 8
+			Return(#KSYNC_ERR_ZIP, z, path$ .. ": unsupported compression method " .. e.method .. " for " .. e.name)
+		EndIf
+		Local lo = e.localoff
+		If lo + 30 > size Then Return(#KSYNC_ERR_ZIP, z, damaged$)
+		If p_KS_R32(b$, lo) <> #KS_SIG_LOCAL Then Return(#KSYNC_ERR_ZIP, z, damaged$)
+		Local lnlen = p_KS_R16(b$, lo + 26)
+		Local lxlen = p_KS_R16(b$, lo + 28)
+		e.lextra = p_KS_Mid(b$, lo + 30 + lnlen, lxlen)
+		e.dataoff = lo + 30 + lnlen + lxlen
+		If e.dataoff + e.csize > size Then Return(#KSYNC_ERR_ZIP, z, damaged$)
+		e.isdir = False
+		If nlen > 0
+			If ByteAsc(e.name, nlen - 1) = 47 Then e.isdir = True
+		EndIf
+		z.e[i] = e
+		z.n = i + 1
+	Next
+	Return(#KSYNC_OK, z, "")
+EndFunction
+
+Function p_KS_ZipOpen(path$)
+	If Not Exists(path$) Then Return(#KSYNC_ERR_IO, Nil, "cannot open " .. path$)
+	Local err, b$ = ?FileToString(path$)
+	If err <> #ERR_NONE Then Return(#KSYNC_ERR_IO, Nil, "cannot read " .. path$ .. ": " .. GetErrorName(err))
+	Local r, z, msg$ = p_KS_ZipParse(b$, path$)
+	Return(r, z, msg$)
+EndFunction
+
+; ------------------------------------------------------------------------
+; 7-Zip
+
+Function p_KS_Quote(s$)
+	Return("\"" .. s$ .. "\"")
+EndFunction
+
+; The default way to run 7-Zip. Pass your own function as opt.Run7z to
+; replace it (same arguments; return 0 when the program could be started).
+; Hollywood 9/10 do not report the exit code, so every result is checked
+; afterwards (CRCs of all extracted files, structure of the new zip).
+Function p_KS_Run7zDefault(exe$, args$, dir$)
+	Local err = ?Execute(exe$, args$, {Directory = dir$, ForceExe = True, ResetKeys = False})
+	Return(err)
+EndFunction
+
+Function p_KS_Run7z(st, args$, dir$)
+	Local err = st.run7z(st.sevenzip, args$, dir$)
+	If err = Nil Then err = 0
+	If err <> 0
+		Local why$ = ""
+		If GetType(err) = #NUMBER Then why$ = ": " .. GetErrorName(err)
+		Return("cannot run 7-Zip (" .. st.sevenzip .. ")" .. why$)
+	EndIf
+	Return("")
+EndFunction
+
+; Unpacks zip$ into dir$ with 7-Zip and checks size and CRC of every file
+; entry of z against the zip's directory.
+Function p_KS_ExtractAndCheck(st, z, zip$, dir$)
+	MakeDirectory(dir$)
+	Local msg$ = p_KS_Run7z(st, "x -tzip -y -bd " .. p_KS_Quote("-o" .. dir$) .. " -- " .. p_KS_Quote(zip$), dir$)
+	If msg$ <> "" Then Return(#KSYNC_ERR_7ZIP, msg$)
+	For Local i = 0 To z.n - 1
+		Local e = z.e[i]
+		If Not e.isdir
+			Local f$ = FullPath(dir$, e.name)
+			If Not Exists(f$)
+				Return(#KSYNC_ERR_7ZIP, "7-Zip did not unpack " .. e.name .. " from " .. zip$ ..
+					" (is the 7-Zip path right?)")
+			EndIf
+			If FileSize(f$) <> e.usize Or p_KS_U32(CRC32(f$)) <> e.crc
+				Return(#KSYNC_ERR_ZIP, "zip entry " .. e.name .. " is damaged (CRC or data error)")
+			EndIf
+		EndIf
+	Next
+	Return(#KSYNC_OK, "")
+EndFunction
+
+; ------------------------------------------------------------------------
+; Zip writing
+
+; Every out[i] has: replaced, method, dtime, ddate, crc, csize, usize and,
+; when replaced, data (the new compressed data).
+Function p_KS_ZipWrite(path$, z, out)
+	Local parts = {}
+	Local np = 0
+	Local pos = 0
+	Local offsets = {}
+	Local cdstart = 0
+	For Local pass = 0 To 1                  ; 0: entries, 1: central directory
+		If pass = 1 Then cdstart = pos
+		For Local i = 0 To z.n - 1
+			Local s = z.e[i]
+			Local o = out[i]
+			Local nlen = p_KS_Len(s.name)
+			Local flags = s.flags & $FFF7                  ; no data descriptor
+			Local needed = s.needed
+			Local extra$ = s.lextra
+			If pass = 1 Then extra$ = s.cextra
+			If o.replaced
+				flags = flags & $0800                     ; keep only the UTF-8 flag
+				needed = 10
+				If o.method = 8 Then needed = 20
+				extra$ = ""
+			EndIf
+			Local h$
+			If pass = 0
+				offsets[i] = pos
+				h$ = p_KS_W32(#KS_SIG_LOCAL) .. p_KS_W16(needed) .. p_KS_W16(flags) ..
+					p_KS_W16(o.method) .. p_KS_W16(o.dtime) .. p_KS_W16(o.ddate) ..
+					p_KS_W32(o.crc) .. p_KS_W32(o.csize) .. p_KS_W32(o.usize) ..
+					p_KS_W16(nlen) .. p_KS_W16(p_KS_Len(extra$)) .. s.name .. extra$
+				parts[np] = h$
+				If o.replaced
+					parts[np + 1] = o.data
+				Else
+					parts[np + 1] = p_KS_Mid(z.buf, s.dataoff, s.csize)
+				EndIf
+				np = np + 2
+				pos = pos + p_KS_Len(h$) + o.csize
+			Else
+				h$ = p_KS_W32(#KS_SIG_CENTRAL) .. p_KS_W16(s.madeby) .. p_KS_W16(needed) ..
+					p_KS_W16(flags) .. p_KS_W16(o.method) .. p_KS_W16(o.dtime) ..
+					p_KS_W16(o.ddate) .. p_KS_W32(o.crc) .. p_KS_W32(o.csize) ..
+					p_KS_W32(o.usize) .. p_KS_W16(nlen) .. p_KS_W16(p_KS_Len(extra$)) ..
+					p_KS_W16(p_KS_Len(s.comment)) .. p_KS_W16(0) .. p_KS_W16(s.intattr) ..
+					p_KS_W32(s.extattr) .. p_KS_W32(offsets[i]) .. s.name .. extra$ .. s.comment
+				parts[np] = h$
+				np = np + 1
+				pos = pos + p_KS_Len(h$)
+			EndIf
+		Next
+	Next
+	parts[np] = p_KS_W32(#KS_SIG_END) .. p_KS_W16(0) .. p_KS_W16(0) .. p_KS_W16(z.n) ..
+		p_KS_W16(z.n) .. p_KS_W32(pos - cdstart) .. p_KS_W32(cdstart) ..
+		p_KS_W16(p_KS_Len(z.comment)) .. z.comment
+	np = np + 1
+	Local err = ?StringToFile(Concat(parts, "", 0, np - 1), path$)
+	If err <> #ERR_NONE Then Return(#KSYNC_ERR_IO, "cannot write " .. path$ .. ": " .. GetErrorName(err))
+	Return(#KSYNC_OK, "")
+EndFunction
+
+; ------------------------------------------------------------------------
+; Kicklayout comparison
+
+Function p_KS_IsBlank(c)
+	Return(c = 32 Or c = 9 Or c = 13)
+EndFunction
+
+; Adds s$ to the list l (fields n, s, low) unless it is already there,
+; ignoring case.
+Function p_KS_ListAdd(l, s$)
+	Local low$ = p_KS_Lower(s$)
+	For Local i = 0 To l.n - 1
+		If l.low[i] = low$ Then Return
+	Next
+	l.s[l.n] = s$
+	l.low[l.n] = low$
+	l.n = l.n + 1
+EndFunction
+
+Function p_KS_ListHas(l, s$)
+	Local low$ = p_KS_Lower(s$)
+	For Local i = 0 To l.n - 1
+		If l.low[i] = low$ Then Return(True)
+	Next
+	Return(False)
+EndFunction
+
+Function p_KS_NewList()
+	Return({n = 0, s = {}, low = {}})
+EndFunction
+
+; The paths of all MODULE lines of a Kicklayout, in order, without
+; duplicates. Comment lines (";MODULE ...") don't start with MODULE and
+; are skipped that way.
+Function p_KS_LayoutModules(d$)
+	Local l = p_KS_NewList()
+	Local len = p_KS_Len(d$)
+	Local p = 0
+	While p < len
+		Local e = p_KS_Find(d$, "\n", p)
+		If e < 0 Then e = len
+		Local q = p
+		While q < e
+			If Not p_KS_IsBlank(ByteAsc(d$, q)) Then Break
+			q = q + 1
+		Wend
+		Local t = q
+		While t < e
+			If p_KS_IsBlank(ByteAsc(d$, t)) Then Break
+			t = t + 1
+		Wend
+		If t - q = 6
+			If p_KS_Lower(p_KS_Mid(d$, q, 6)) = "module"
+				Local a = t
+				While a < e
+					If Not p_KS_IsBlank(ByteAsc(d$, a)) Then Break
+					a = a + 1
+				Wend
+				Local b = a
+				While b < e
+					Local c = ByteAsc(d$, b)
+					If p_KS_IsBlank(c) Or c = 59 Then Break
+					b = b + 1
+				Wend
+				If b > a Then p_KS_ListAdd(l, p_KS_Mid(d$, a, b - a))
+			EndIf
+		EndIf
+		p = e + 1
+	Wend
+	Return(l)
+EndFunction
+
+; Returns the MODULE paths found only in the zip's and only in the
+; Amiga's copy.
+Function p_KS_LayoutDiff(zd$, ad$)
+	Local zm = p_KS_LayoutModules(zd$)
+	Local am = p_KS_LayoutModules(ad$)
+	Local onlyzip = p_KS_NewList()
+	Local onlyamiga = p_KS_NewList()
+	For Local i = 0 To zm.n - 1
+		If Not p_KS_ListHas(am, zm.s[i]) Then p_KS_ListAdd(onlyzip, zm.s[i])
+	Next
+	For Local i = 0 To am.n - 1
+		If Not p_KS_ListHas(zm, am.s[i]) Then p_KS_ListAdd(onlyamiga, am.s[i])
+	Next
+	Return(onlyzip, onlyamiga)
+EndFunction
+
+; ------------------------------------------------------------------------
+; Report texts (the same wording as the KickSync command)
+
+; "UPDATED (Amiga: kernel, renamed)", "kept (zip is newer)", ...
+Function KickSync.ResultText(rep)
+	Local t$ = ""
+	Switch rep.action
+	Case #KSYNC_ACT_UPDATED:
+		t$ = "UPDATED"
+		If rep.reason = #KSYNC_REASON_NO_AMIGA_VERSION Then t$ = t$ .. " (no version on Amiga)"
+		If rep.reason = #KSYNC_REASON_NO_ZIP_VERSION Then t$ = t$ .. " (no version in zip)"
+		If rep.reason = #KSYNC_REASON_TAKE_KICKLAYOUT Then t$ = t$ .. " (--take-kicklayout, see below)"
+		If rep.renamed Then t$ = t$ .. " (Amiga: " .. rep.amiganame .. ", renamed)"
+	Case #KSYNC_ACT_SAME:
+		t$ = "same"
+		If rep.identical
+			t$ = t$ .. " (identical)"
+		ElseIf rep.sizediffers
+			t$ = t$ .. " (size differs!)"
+		EndIf
+	Case #KSYNC_ACT_KEPT_KICKLAYOUT:
+		t$ = "kept (Kicklayout differs, see below)"
+	Case #KSYNC_ACT_KEPT_ZIP_NEWER:
+		t$ = "kept (zip is newer)"
+	Case #KSYNC_ACT_KEPT_NOT_ON_AMIGA:
+		t$ = "kept (not on Amiga)"
+	EndSwitch
+	Return(t$)
+EndFunction
+
+; The notes printed after the table for a Kicklayout that differs (empty
+; for any other entry).
+Function KickSync.LayoutNotes(rep)
+	If rep.action <> #KSYNC_ACT_KEPT_KICKLAYOUT And rep.reason <> #KSYNC_REASON_TAKE_KICKLAYOUT
+		Return("")
+	EndIf
+	Local t$
+	If rep.action = #KSYNC_ACT_KEPT_KICKLAYOUT
+		t$ = "\n" .. rep.entryname .. ": the Amiga's copy (" .. rep.amiganame .. ") differs; the zip's copy was kept.\n"
+	Else
+		t$ = "\n" .. rep.entryname .. ": replaced by the Amiga's copy (" .. rep.amiganame .. ").\n"
+	EndIf
+	For Local i = 0 To rep.layoutonlyzip.n - 1
+		t$ = t$ .. "  only in the zip's copy:    MODULE " .. rep.layoutonlyzip.s[i] .. "\n"
+	Next
+	For Local i = 0 To rep.layoutonlyamiga.n - 1
+		t$ = t$ .. "  only in the Amiga's copy:  MODULE " .. rep.layoutonlyamiga.s[i] .. "\n"
+	Next
+	If rep.layoutonlyzip.n = 0 And rep.layoutonlyamiga.n = 0
+		t$ = t$ .. "  Both load the same modules; they differ only in other lines\n" ..
+			"  (upper/lower case, comments, order or other keywords).\n"
+	EndIf
+	If rep.action = #KSYNC_ACT_KEPT_KICKLAYOUT
+		t$ = t$ .. "  Merge by hand if needed, or use --take-kicklayout to take the Amiga's copy.\n"
+	EndIf
+	Return(t$)
+EndFunction
+
+; ------------------------------------------------------------------------
+; Updating a Kickstart.zip
+
+Function p_KS_Opt(opt, key$, def)
+	Local v = RawGet(opt, key$)
+	If v = Nil Then Return(def)
+	Return(v)
+EndFunction
+
+; Turns a path into an absolute one (7-Zip runs in other directories).
+Function p_KS_AbsPath(p$)
+	If IsAbsolutePath(p$) Then Return(p$)
+	Return(FullPath(GetCurrentDirectory(), p$))
+EndFunction
+
+Function p_KS_SameFile(a$, b$)
+	Return(LowerStr(CanonizePath(a$)) = LowerStr(CanonizePath(b$)))
+EndFunction
+
+Function p_KS_DoUpdate(opt, res, st)
+	Local host$ = p_KS_Opt(opt, "host", "")
+	Local port = p_KS_Opt(opt, "port", KickSync.DefaultPort)
+	Local timeout = p_KS_Opt(opt, "timeout", 15000)
+	Local input$ = p_KS_Opt(opt, "inputzip", "")
+	Local output$ = p_KS_Opt(opt, "outputzip", "")
+	Local dryrun = p_KS_Opt(opt, "dryrun", False)
+	Local force = p_KS_Opt(opt, "force", False)
+	Local takelayout = p_KS_Opt(opt, "takekicklayout", False)
+	Local onentry = p_KS_Opt(opt, "onentry", Nil)
+	Local onwarning = p_KS_Opt(opt, "onwarning", Nil)
+	Local onprogress = p_KS_Opt(opt, "onprogress", Nil)
+	Local ud = p_KS_Opt(opt, "userdata", Nil)
+	Local conn = p_KS_Opt(opt, "conn", Nil)
+	st.sevenzip = p_KS_Opt(opt, "sevenzip", "7z")
+	st.run7z = p_KS_Opt(opt, "run7z", p_KS_Run7zDefault)
+
+	If input$ = "" Or (conn = Nil And host$ = "")
+		res.error = "host and input zip are required"
+		Return(#KSYNC_ERR_ARGS)
+	EndIf
+	If output$ = "" Then output$ = FullPath(PathPart(input$), KickSync.DefaultOutputName())
+	res.output = output$
+
+	If Not dryrun And Exists(output$)
+		If p_KS_SameFile(output$, input$)
+			res.error = "output would overwrite the input zip"
+			Return(#KSYNC_ERR_ARGS)
+		EndIf
+		If Not force
+			res.error = output$ .. " exists (use Force to overwrite)"
+			Return(#KSYNC_ERR_EXISTS)
+		EndIf
+	EndIf
+
+	; read the zip and unpack it with 7-Zip (CRCs are checked)
+	p_KS_Call(onprogress, "Reading " .. input$, 0, 0, ud)
+	Local r, z, err$ = p_KS_ZipOpen(input$)
+	If r <> #KSYNC_OK
+		res.error = err$
+		Return(r)
+	EndIf
+	st.tmpbase = GetTempFileName()
+	st.tmp = st.tmpbase .. "_ks"
+	MakeDirectory(st.tmp)
+	Local indir$ = FullPath(st.tmp, "in")
+	Local upddir$ = FullPath(st.tmp, "upd")
+	r, err$ = p_KS_ExtractAndCheck(st, z, p_KS_AbsPath(input$), indir$)
+	If r <> #KSYNC_OK
+		res.error = err$
+		Return(r)
+	EndIf
+
+	Local out = {}
+	For Local i = 0 To z.n - 1
+		Local e = z.e[i]
+		out[i] = {replaced = False, method = e.method, dtime = e.dtime, ddate = e.ddate,
+			crc = e.crc, csize = e.csize, usize = e.usize, data = ""}
+	Next
+
+	If conn = Nil
+		p_KS_Call(onprogress, "Connecting to " .. host$ .. ":" .. port, 0, 0, ud)
+		conn, err$ = KickSync.Connect(host$, port, timeout)
+		If conn = Nil
+			res.error = err$
+			Return(#KSYNC_ERR_CONNECT)
+		EndIf
+		st.conn = conn
+		st.ownconn = True
+	EndIf
+
+	; names on the Amiga, to match case-insensitively; if LIST is refused,
+	; ask with the zip's spelling (AmigaOS ignores case)
+	Local havelist = False
+	Local remote, nremote
+	r, remote, nremote = KickSync.List(conn)
+	If r = #KSYNC_OK
+		havelist = True
+	ElseIf r = #KSYNC_ERR_SERVER
+		p_KS_Call(onwarning, "server refused LIST (" .. KickSync.ConnError(conn) ..
+			"), looking up names as spelled in the zip", ud)
+	Else
+		res.error = KickSync.ConnError(conn)
+		Return(r)
+	EndIf
+
+	Local nupd = 0
+	For Local i = 0 To z.n - 1
+		Local e = z.e[i]
+		Local o = out[i]
+		If Not e.isdir
+			res.entries = res.entries + 1
+			p_KS_Call(onprogress, "Checking " .. e.name, i, z.n, ud)
+
+			For Local k = 0 To i - 1
+				If Not z.e[k].isdir And KickSync.NameEqual(z.e[k].name, e.name)
+					p_KS_Call(onwarning, z.e[k].name .. " and " .. e.name ..
+						" differ only in case; AmigaOS treats them as the same file", ud)
+				EndIf
+			Next
+
+			Local err1, data$ = ?FileToString(FullPath(indir$, e.name))
+			If err1 <> #ERR_NONE
+				res.error = "cannot read the unpacked " .. e.name
+				Return(#KSYNC_ERR_IO)
+			EndIf
+
+			Local rep = {entryname = e.name, amiganame = "", action = #KSYNC_ACT_SAME,
+				reason = #KSYNC_REASON_NONE, renamed = False, sizediffers = False,
+				identical = False, iskicklayout = False, zipver = "", amigaver = "-", layoutonlyzip = p_KS_NewList(), layoutonlyamiga = p_KS_NewList()}
+			Local found, zipver$ = KickSync.FindVerString(data$)
+			rep.zipversion = KickSync.ParseVersion(zipver$)
+			rep.amigaversion = KickSync.NewVersion()
+
+			Local name$ = p_KS_BaseName(e.name)
+			rep.iskicklayout = KickSync.NameEqual(name$, "Kicklayout")
+			Local rname$ = ""
+			If havelist
+				For Local k = 0 To nremote - 1
+					If KickSync.NameEqual(remote[k].name, name$)
+						rname$ = remote[k].name
+						Break
+					EndIf
+				Next
+			Else
+				rname$ = name$
+			EndIf
+
+			Local take = False
+			Local layout = False
+			Local info = {name = rname$, size = 0, date = 0, ver = ""}
+			r = #KSYNC_NOT_FOUND
+			If rname$ <> "" Then r, info = KickSync.Info(conn, rname$)
+			If r = #KSYNC_NOT_FOUND Or r = #KSYNC_ERR_SERVER
+				If r = #KSYNC_ERR_SERVER Then p_KS_Call(onwarning, e.name .. ": " .. KickSync.ConnError(conn), ud)
+				rep.action = #KSYNC_ACT_KEPT_NOT_ON_AMIGA
+			ElseIf r <> #KSYNC_OK
+				res.error = KickSync.ConnError(conn)
+				Return(r)
+			Else
+				rep.amiganame = rname$
+				rep.renamed = (rname$ <> name$)
+				rep.amigaversion = KickSync.ParseVersion(info.ver)
+				Local cmp = KickSync.CompareVersion(rep.amigaversion, rep.zipversion)
+				If rep.iskicklayout
+					layout = True               ; never by version: decided below
+				ElseIf rep.amigaversion.n = 0
+					take = True
+					rep.reason = #KSYNC_REASON_NO_AMIGA_VERSION
+				ElseIf rep.zipversion.n = 0
+					take = True
+					rep.reason = #KSYNC_REASON_NO_ZIP_VERSION
+				ElseIf cmp > 0
+					take = True
+					rep.reason = #KSYNC_REASON_NEWER
+				ElseIf cmp = 0
+					rep.action = #KSYNC_ACT_SAME
+					rep.sizediffers = (info.size <> e.usize)
+				Else
+					rep.action = #KSYNC_ACT_KEPT_ZIP_NEWER
+				EndIf
+			EndIf
+
+			; Download the Amiga copy when it goes into the zip, when it may
+			; be identical to the zip copy (same size), or to compare
+			; Kicklayouts.
+			Local blob$ = ""
+			If (take Or layout) And (layout Or info.size = e.usize Or Not dryrun)
+				r, blob$ = KickSync.Get(conn, rname$)
+				If r <> #KSYNC_OK
+					res.error = "downloading " .. rname$ .. ": " .. KickSync.ConnError(conn)
+					If r = #KSYNC_NOT_FOUND Then r = #KSYNC_ERR_SERVER
+					Return(r)
+				EndIf
+				Local gotfound, gotver$ = KickSync.FindVerString(blob$)
+				If KickSync.CompareVersion(KickSync.ParseVersion(gotver$), rep.amigaversion) <> 0
+					res.error = rname$ .. " changed on the Amiga while downloading"
+					Return(#KSYNC_ERR_PROTOCOL)
+				EndIf
+				If blob$ = data$
+					take = False
+					layout = False
+					rep.action = #KSYNC_ACT_SAME
+					rep.reason = #KSYNC_REASON_NONE
+					rep.identical = True
+				ElseIf layout
+					rep.layoutonlyzip, rep.layoutonlyamiga = p_KS_LayoutDiff(data$, blob$)
+					If takelayout
+						take = True
+						rep.reason = #KSYNC_REASON_TAKE_KICKLAYOUT
+					Else
+						rep.action = #KSYNC_ACT_KEPT_KICKLAYOUT
+					EndIf
+				EndIf
+			EndIf
+			data$ = Nil
+
+			If take
+				rep.action = #KSYNC_ACT_UPDATED
+				res.updated = res.updated + 1
+				If Not dryrun
+					; packed with 7-Zip below; the name stays e.name
+					MakeDirectory(upddir$)
+					Local err2 = ?StringToFile(blob$, FullPath(upddir$, "e" .. i))
+					If err2 <> #ERR_NONE
+						res.error = "cannot write a temporary file in " .. upddir$
+						Return(#KSYNC_ERR_IO)
+					EndIf
+					o.replaced = True
+					o.crc = p_KS_U32(CRC32Str(blob$))
+					o.usize = p_KS_Len(blob$)
+					o.dtime, o.ddate = p_KS_AmigaToDos(info.date)
+					nupd = nupd + 1
+				EndIf
+			EndIf
+			blob$ = Nil
+
+			rep.zipver = KickSync.FormatVersion(rep.zipversion)
+			If rep.amiganame <> "" Then rep.amigaver = KickSync.FormatVersion(rep.amigaversion)
+			rep.result = KickSync.ResultText(rep)
+			rep.notes = KickSync.LayoutNotes(rep)
+			res.reports[res.entries - 1] = rep
+			p_KS_Call(onentry, rep, ud)
+		EndIf
+	Next
+
+	If dryrun Then Return(#KSYNC_OK)
+	If z.n > 65535
+		res.error = "too many entries"
+		Return(#KSYNC_ERR_ZIP)
+	EndIf
+
+	; deflate the updated files with 7-Zip and take the compressed data
+	; from its zip
+	If nupd > 0
+		p_KS_Call(onprogress, "Packing " .. nupd .. " updated module(s)", z.n, z.n, ud)
+		Local updzip$ = FullPath(st.tmp, "upd.zip")
+		Local args$ = "a -tzip -mm=Deflate -mx=9 -y -bd -- " .. p_KS_Quote(updzip$)
+		For Local i = 0 To z.n - 1
+			If out[i].replaced Then args$ = args$ .. " e" .. i
+		Next
+		Local msg$ = p_KS_Run7z(st, args$, upddir$)
+		If msg$ <> ""
+			res.error = msg$
+			Return(#KSYNC_ERR_7ZIP)
+		EndIf
+		Local u
+		r, u, err$ = p_KS_ZipOpen(updzip$)
+		If r <> #KSYNC_OK
+			res.error = "7-Zip did not create " .. updzip$ .. " (" .. err$ .. ")"
+			Return(#KSYNC_ERR_7ZIP)
+		EndIf
+		Local packed = {}
+		For Local k = 0 To u.n - 1
+			packed[u.e[k].name] = u.e[k]
+		Next
+		For Local i = 0 To z.n - 1
+			Local o = out[i]
+			If o.replaced
+				Local pe = RawGet(packed, "e" .. i)
+				If pe = Nil
+					res.error = "7-Zip did not pack " .. z.e[i].name
+					Return(#KSYNC_ERR_7ZIP)
+				EndIf
+				If pe.crc <> o.crc Or pe.usize <> o.usize
+					res.error = "7-Zip packed " .. z.e[i].name .. " wrongly (CRC differs)"
+					Return(#KSYNC_ERR_7ZIP)
+				EndIf
+				o.method = pe.method
+				o.csize = pe.csize
+				o.data = p_KS_Mid(u.buf, pe.dataoff, pe.csize)
+			EndIf
+		Next
+	EndIf
+
+	; write to a temporary file, check it, then rename
+	p_KS_Call(onprogress, "Writing " .. output$, z.n, z.n, ud)
+	st.tmpout = output$ .. ".kstmp"
+	r, err$ = p_KS_ZipWrite(st.tmpout, z, out)
+	If r <> #KSYNC_OK
+		res.error = err$
+		Return(r)
+	EndIf
+	out = Nil
+	Local v
+	r, v, err$ = p_KS_ZipOpen(st.tmpout)
+	If r = #KSYNC_OK And v.n <> z.n Then r = #KSYNC_ERR_ZIP
+	If r = #KSYNC_OK Then r, err = p_KS_ExtractAndCheck(st, v, p_KS_AbsPath(st.tmpout), FullPath(st.tmp, "verify"))
+	If r <> #KSYNC_OK
+		res.error = "verification of " .. st.tmpout .. " failed: " .. err$
+		Return(r)
+	EndIf
+	If Exists(output$) Then DeleteFile(output$)
+	Local err3 = ?Rename(st.tmpout, FilePart(output$))
+	If err3 <> #ERR_NONE
+		res.error = "cannot create " .. output$ .. ": " .. GetErrorName(err3)
+		Return(#KSYNC_ERR_IO)
+	EndIf
+	st.tmpout = ""
+	Return(#KSYNC_OK)
+EndFunction
+
+; Updates a Kickstart.zip. Options (table fields, any case):
+;   Host            name or IP address of the Amiga (required unless Conn)
+;   Port            KickServ port (default 6800)
+;   Timeout         network timeout in milliseconds (default 15000)
+;   Conn            an open connection from KickSync.Connect() to use
+;   InputZip        the Kickstart.zip to update (required, never changed)
+;   OutputZip       the new zip (default: Kickstart_<YYYY-MM-DD>.zip in the
+;                   directory of InputZip)
+;   DryRun          True: only report, write nothing
+;   Force           True: overwrite an existing OutputZip
+;   TakeKicklayout  True: replace Kicklayout by the Amiga copy if it differs
+;   SevenZip        path of the 7-Zip program (default "7z")
+;   Run7z           optional function(exe$, args$, dir$) that runs 7-Zip
+;   OnEntry         optional function(report, userdata), once per file entry
+;   OnWarning       optional function(message$, userdata)
+;   OnProgress      optional function(message$, done, total, userdata)
+;   UserData        passed to the callbacks
+;
+; Returns status and a result table:
+;   entries     file entries examined
+;   updated     entries taken from the Amiga
+;   output      path of the new zip
+;   error       message when status <> #KSYNC_OK
+;   reports     the entry reports (index 0 ... entries - 1)
+;
+; An entry report has: entryname (name in the zip, kept in the new zip),
+; amiganame ("" if not on the Amiga), zipversion, amigaversion (see
+; KickSync.ParseVersion), zipver and amigaver (formatted, "-" if not on
+; the Amiga), action (#KSYNC_ACT_*), reason (#KSYNC_REASON_*), renamed,
+; sizediffers, identical, iskicklayout, layoutonlyzip and layoutonlyamiga
+; (lists with fields n and s[0 ... n-1]: MODULE paths found in only one
+; Kicklayout), result (KickSync.ResultText) and notes
+; (KickSync.LayoutNotes).
+;
+; Option fields are read with RawGet() under their lower-case names, so
+; set them with the dot or constructor syntax (opt.InputZip = ... or
+; {InputZip = ...}), not with brackets (opt["InputZip"]).
+Function KickSync.UpdateZip(opt)
+	Local res = {entries = 0, updated = 0, output = "", error = "", reports = {}}
+	; st.conn is only set (and then closed here) for a connection opened
+	; by p_KS_DoUpdate itself
+	Local st = {ownconn = False, tmpbase = "", tmp = "", tmpout = ""}
+	Local r = p_KS_DoUpdate(opt, res, st)
+	If st.ownconn Then KickSync.Close(st.conn)
+	If st.tmpout <> "" Then DeleteFile(st.tmpout)
+	If st.tmp <> "" Then DeleteFile(st.tmp)
+	If st.tmpbase <> "" Then DeleteFile(st.tmpbase)
+	Return(r, res)
+EndFunction

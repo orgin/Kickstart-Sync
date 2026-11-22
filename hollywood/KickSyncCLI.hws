@@ -1,0 +1,171 @@
+/*
+** KickSyncCLI.hws - example front end for kicksync.hws
+**
+** Does the same as the KickSync command of Kickstart Sync and prints the
+** same report, so it doubles as an example of how to call the library.
+**
+**   KickSyncCLI -host HOST[:PORT] -zip Kickstart.zip [-out New.zip]
+**               [-dryrun] [-force] [-takekicklayout] [-timeout SECS]
+**               [-sevenzip PATH]
+**   KickSyncCLI -list -host HOST[:PORT]
+**
+** Public domain (Unlicense).
+*/
+
+@VERSION 9,0
+@APPTITLE "KickSync"
+@APPVERSION "$VER: KickSync 1.1 (22.11.2026)"
+@DISPLAY {Hidden = True}
+
+@INCLUDE "kicksync.hws"
+
+Function p_Usage()
+	ConsolePrint("usage: KickSync -host HOST[:PORT] -zip Kickstart.zip [-out New_Kickstart.zip] [options]")
+	ConsolePrint("       KickSync -list -host HOST[:PORT]")
+	ConsolePrint("")
+	ConsolePrint("Updates Kickstart.zip with newer modules from an AmigaOS 4 machine running")
+	ConsolePrint("the KickServ commodity. PORT defaults to 6800. Without -out the result is")
+	ConsolePrint("written to Kickstart_<YYYY-MM-DD>.zip next to Kickstart.zip.")
+	ConsolePrint("")
+	ConsolePrint("options:")
+	ConsolePrint("  -dryrun           only show what would be updated")
+	ConsolePrint("  -force            overwrite the output file if it exists")
+	ConsolePrint("  -takekicklayout   replace Kicklayout with the Amiga's copy if it differs")
+	ConsolePrint("  -list             list the files offered by the Amiga and exit")
+	ConsolePrint("  -timeout SECS     network timeout (default 15)")
+	ConsolePrint("  -sevenzip PATH    the 7-Zip program (default 7z)")
+EndFunction
+
+Function p_Pad(s$, w)
+	Local n = w - ByteLen(s$)
+	If n <= 0 Then Return(s$)
+	Return(s$ .. RepeatStr(" ", n))
+EndFunction
+
+Function p_OnWarning(msg$, ud)
+	ConsolePrint("warning: " .. msg$)
+EndFunction
+
+; Collects the reports; the table is printed when all entries are known
+; (the first column is as wide as the longest entry name).
+Function p_OnEntry(rep, rows)
+	rows.r[rows.n] = rep
+	rows.n = rows.n + 1
+EndFunction
+
+Function p_List(host$, port, timeout)
+	Local c, err$ = KickSync.Connect(host$, port, timeout)
+	If c = Nil
+		ConsolePrint("KickSync: " .. err$)
+		Return
+	EndIf
+	Local r, files, n = KickSync.List(c)
+	If r <> #KSYNC_OK
+		ConsolePrint("KickSync: LIST failed: " .. KickSync.ConnError(c))
+		KickSync.Close(c)
+		Return
+	EndIf
+	For Local i = 0 To n - 1
+		Local f = files[i]
+		Local y, mo, d, h, mi, s = KickSync.AmigaDate(f.date)
+		ConsolePrint(p_Pad(f.name, 28) .. " " .. RepeatStr(" ", 8 - ByteLen(ToString(f.size))) ..
+			f.size .. "  " .. PadNum(y, 4) .. "-" .. PadNum(mo, 2) .. "-" .. PadNum(d, 2) ..
+			" " .. PadNum(h, 2) .. ":" .. PadNum(mi, 2) .. "  " .. f.ver)
+	Next
+	KickSync.Close(c)
+EndFunction
+
+Function p_Main()
+	Local args, nargs = GetCommandLine()
+	Local hostport$ = ""
+	Local zip$ = ""
+	Local out$ = ""
+	Local dryrun = False
+	Local force = False
+	Local takelayout = False
+	Local list = False
+	Local timeout = 15
+	Local sevenzip$ = "7z"
+
+	For Local i = 0 To nargs - 1
+		Local a$ = LowerStr(args[i].arg)
+		Local p$ = args[i].param
+		If a$ = "host"
+			hostport$ = p$
+		ElseIf a$ = "zip"
+			zip$ = p$
+		ElseIf a$ = "out"
+			out$ = p$
+		ElseIf a$ = "dryrun"
+			dryrun = True
+		ElseIf a$ = "force"
+			force = True
+		ElseIf a$ = "takekicklayout"
+			takelayout = True
+		ElseIf a$ = "list"
+			list = True
+		ElseIf a$ = "timeout"
+			timeout = Val(p$)
+			If timeout <= 0
+				ConsolePrint("KickSync: invalid timeout")
+				Return
+			EndIf
+		ElseIf a$ = "sevenzip"
+			sevenzip$ = p$
+		Else
+			ConsolePrint("KickSync: unknown option -" .. args[i].arg)
+			p_Usage()
+			Return
+		EndIf
+	Next
+
+	If hostport$ = "" Or (Not list And zip$ = "")
+		p_Usage()
+		Return
+	EndIf
+	Local r, host$, port = KickSync.ParseHostPort(hostport$)
+	If r <> #KSYNC_OK
+		ConsolePrint("KickSync: invalid HOST[:PORT] \"" .. hostport$ .. "\"")
+		Return
+	EndIf
+	If list
+		p_List(host$, port, timeout * 1000)
+		Return
+	EndIf
+
+	Local rows = {n = 0, r = {}}
+	Local res
+	r, res = KickSync.UpdateZip({Host = host$, Port = port, Timeout = timeout * 1000,
+		InputZip = zip$, OutputZip = out$, DryRun = dryrun, Force = force,
+		TakeKicklayout = takelayout, SevenZip = sevenzip$,
+		OnEntry = p_OnEntry, OnWarning = p_OnWarning, UserData = rows})
+
+	If rows.n > 0
+		Local w = 5
+		For Local k = 0 To rows.n - 1
+			w = Max(w, ByteLen(rows.r[k].entryname))
+		Next
+		ConsolePrint(p_Pad("Entry", w) .. "  " .. p_Pad("Zip", 10) .. " " .. p_Pad("Amiga", 10) .. " Result")
+		Local notes$ = ""
+		For Local k = 0 To rows.n - 1
+			Local rep = rows.r[k]
+			ConsolePrint(p_Pad(rep.entryname, w) .. "  " .. p_Pad(rep.zipver, 10) .. " " ..
+				p_Pad(rep.amigaver, 10) .. " " .. rep.result)
+			notes$ = notes$ .. rep.notes
+		Next
+		If notes$ <> "" Then ConsolePrintNR(notes$)
+	EndIf
+
+	If r <> #KSYNC_OK
+		ConsolePrint("KickSync: " .. res.error)
+		Return
+	EndIf
+	If dryrun
+		ConsolePrint("\n" .. res.updated .. " module(s) would be updated (dry run, nothing written)")
+	Else
+		ConsolePrint("\n" .. res.updated .. " module(s) updated, written to " .. res.output)
+	EndIf
+EndFunction
+
+p_Main()
+End

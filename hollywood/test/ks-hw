@@ -1,0 +1,41 @@
+#!/bin/sh
+# Runs KickSyncCLI.hws (translated to Lua by hw2lua.py) with the arguments
+# of the C KickSync command, so that host/test.sh can test the Hollywood
+# version too. Exit codes are taken from the output (Hollywood scripts
+# have none): 2 for usage errors, 1 for "KickSync: <error>", else 0.
+HERE=$(cd "$(dirname "$0")" && pwd)
+BUILD=${TMPDIR:-/tmp}/kicksync-hw-$(id -u)
+mkdir -p "$BUILD"
+python3 "$HERE/hw2lua.py" "$HERE/../KickSyncCLI.hws" > "$BUILD/KickSyncCLI.lua" || exit 3
+
+npos=0
+for a in "$@"; do
+    shift
+    if [ -n "${want_timeout:-}" ]; then set -- "$@" -timeout "$a"; want_timeout=; continue; fi
+    case "$a" in
+        -n|--dry-run)          set -- "$@" -dryrun ;;
+        -f|--force)            set -- "$@" -force ;;
+        -k|--take-kicklayout)  set -- "$@" -takekicklayout ;;
+        -l|--list)             set -- "$@" -list ;;
+        -t|--timeout)          want_timeout=1 ;;
+        -*)                    set -- "$@" "$a" ;;
+        *)  npos=$((npos + 1))
+            case $npos in
+                1) set -- "$@" -host "$a" ;;
+                2) set -- "$@" -zip "$a" ;;
+                3) set -- "$@" -out "$a" ;;
+                *) set -- "$@" -toomany "$a" ;;
+            esac ;;
+    esac
+done
+
+out=$BUILD/out.$$
+lua5.4 "$HERE/run.lua" "$BUILD/KickSyncCLI.lua" "$@" > "$out" 2>&1
+lrc=$?
+cat "$out"
+rc=0
+if grep -q -e '^KickSync: invalid HOST' -e '^usage:' -e '^KickSync: unknown option' "$out"; then rc=2
+elif grep -q '^KickSync: ' "$out" || [ $lrc -ne 0 ]; then rc=1
+fi
+rm -f "$out"
+exit $rc

@@ -163,6 +163,13 @@ With tap/bridged networking, use the guest's IP address directly.
 `host/kickserv_mock.py DIR [PORT]` serves a local directory using the same
 protocol, so you can try KickSync without an Amiga (`make test` uses it).
 
+## Hollywood version: `hollywood/`
+
+`hollywood/kicksync.hws` is the same library in Hollywood (9.0 or newer,
+uses 7-Zip for the deflate work), for Hollywood programs such as Kyvos.
+See [hollywood/README.md](hollywood/README.md). `hollywood/test/run_tests.sh`
+runs the test suite above against it without needing Hollywood.
+
 ## Releases
 
     tools/make_lha.sh
