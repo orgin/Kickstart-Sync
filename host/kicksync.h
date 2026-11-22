@@ -21,7 +21,14 @@
  *     directory part, ignoring upper/lower case like AmigaOS does.
  *   - The Amiga copy is taken unless both copies carry a $VER: version and
  *     the Amiga version is not newer. So a missing $VER: on either side
- *     means the Amiga copy is taken.
+ *     means the Amiga copy is taken - unless it is byte for byte the same
+ *     as the zip copy (checked whenever the sizes match), then it counts
+ *     as KSYNC_ACT_SAME with identical set.
+ *   - Kicklayout is never replaced (whatever its $VER: says): it lists the
+ *     modules for one particular machine. If the Amiga copy differs, the
+ *     entry is KSYNC_ACT_KEPT_KICKLAYOUT and the report lists the MODULE
+ *     lines found in only one of the two copies. Set take_kicklayout to
+ *     take the Amiga copy anyway.
  *   - Entries are written with the exact name (and case) from the original
  *     zip, in the original order. Unchanged entries are copied verbatim.
  *
@@ -37,7 +44,7 @@
 extern "C" {
 #endif
 
-#define KSYNC_LIB_VERSION   "1.0"
+#define KSYNC_LIB_VERSION   "1.1"
 #define KSYNC_DEFAULT_PORT  6800
 #define KSYNC_PROTO_VERSION 1
 #define KSYNC_NAME_MAX      256
@@ -115,16 +122,18 @@ void ksync_free(void *p);
 
 typedef enum ksync_action {
     KSYNC_ACT_UPDATED,          /* Amiga copy put into the new zip */
-    KSYNC_ACT_SAME,             /* same version, zip copy kept */
+    KSYNC_ACT_SAME,             /* same version or identical bytes, zip copy kept */
     KSYNC_ACT_KEPT_ZIP_NEWER,   /* zip copy has a higher version */
-    KSYNC_ACT_KEPT_NOT_ON_AMIGA /* no file of that name on the Amiga */
+    KSYNC_ACT_KEPT_NOT_ON_AMIGA,/* no file of that name on the Amiga */
+    KSYNC_ACT_KEPT_KICKLAYOUT   /* Kicklayout differs; zip copy kept (see layout_*) */
 } ksync_action;
 
 typedef enum ksync_reason {
     KSYNC_REASON_NONE,
     KSYNC_REASON_NEWER,             /* Amiga version is higher */
     KSYNC_REASON_NO_AMIGA_VERSION,  /* Amiga file has no $VER: */
-    KSYNC_REASON_NO_ZIP_VERSION     /* zip entry has no $VER: */
+    KSYNC_REASON_NO_ZIP_VERSION,    /* zip entry has no $VER: */
+    KSYNC_REASON_TAKE_KICKLAYOUT    /* Kicklayout taken because take_kicklayout is set */
 } ksync_reason;
 
 typedef struct ksync_entry_report {
@@ -136,6 +145,14 @@ typedef struct ksync_entry_report {
     ksync_reason   reason;         /* why it was updated */
     int         renamed;        /* Amiga spelling differs in case */
     int         size_differs;   /* KSYNC_ACT_SAME but sizes differ */
+    int         identical;      /* KSYNC_ACT_SAME because the bytes are the same */
+    int         is_kicklayout;  /* the entry is a Kicklayout file */
+    /* Kicklayout only (KSYNC_ACT_KEPT_KICKLAYOUT, or UPDATED by take_kicklayout):
+       MODULE paths found in only one copy, compared without regard to case.
+       Both counts 0 means both copies load the same modules and differ only
+       in other lines (case, comments, order, other keywords). */
+    const char *const *layout_only_zip;    size_t layout_only_zip_count;
+    const char *const *layout_only_amiga;  size_t layout_only_amiga_count;
 } ksync_entry_report;
 
 /* Pointers in the report are only valid during the call. */
@@ -151,6 +168,7 @@ typedef struct ksync_options {
     const char *output_zip;     /* NULL: Kickstart_<YYYY-MM-DD>.zip in cwd */
     int         dry_run;        /* only report, write nothing */
     int         force;          /* overwrite an existing output file */
+    int         take_kicklayout;/* replace Kicklayout with the Amiga copy if it differs */
     ksync_entry_fn on_entry;       /* optional, called once per file entry */
     ksync_warn_fn  on_warning;     /* optional */
     void       *user;

@@ -6,6 +6,7 @@
  */
 #include "kicksync.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,7 +23,55 @@ typedef struct row {
 typedef struct rows {
     row   *r;
     size_t n, cap;
+    char  *notes;               /* printed after the table */
+    size_t notes_len;
 } rows;
+
+static void oom(void)
+{
+    fprintf(stderr, PROGNAME ": out of memory\n");
+    exit(1);
+}
+
+static void note(rows *t, const char *fmt, ...)
+{
+    va_list ap, ap2;
+    int n;
+    char *nn;
+
+    va_start(ap, fmt);
+    va_copy(ap2, ap);
+    n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (n < 0 || !(nn = (char *)realloc(t->notes, t->notes_len + (size_t)n + 1)))
+        oom();
+    t->notes = nn;
+    vsnprintf(t->notes + t->notes_len, (size_t)n + 1, fmt, ap2);
+    va_end(ap2);
+    t->notes_len += (size_t)n;
+}
+
+/* What differs between the two Kicklayouts, for the notes after the table. */
+static void layout_notes(rows *t, const ksync_entry_report *rep)
+{
+    size_t i;
+
+    if (rep->action == KSYNC_ACT_KEPT_KICKLAYOUT)
+        note(t, "\n%s: the Amiga's copy (%s) differs; the zip's copy was kept.\n",
+             rep->entry_name, rep->amiga_name);
+    else
+        note(t, "\n%s: replaced by the Amiga's copy (%s).\n",
+             rep->entry_name, rep->amiga_name);
+    for (i = 0; i < rep->layout_only_zip_count; i++)
+        note(t, "  only in the zip's copy:    MODULE %s\n", rep->layout_only_zip[i]);
+    for (i = 0; i < rep->layout_only_amiga_count; i++)
+        note(t, "  only in the Amiga's copy:  MODULE %s\n", rep->layout_only_amiga[i]);
+    if (!rep->layout_only_zip_count && !rep->layout_only_amiga_count)
+        note(t, "  Both load the same modules; they differ only in other lines\n"
+                "  (upper/lower case, comments, order or other keywords).\n");
+    if (rep->action == KSYNC_ACT_KEPT_KICKLAYOUT)
+        note(t, "  Merge by hand if needed, or use --take-kicklayout to take the Amiga's copy.\n");
+}
 
 static void usage(FILE *fp)
 {
@@ -38,6 +87,8 @@ static void usage(FILE *fp)
         "options:\n"
         "  -n, --dry-run        only show what would be updated\n"
         "  -f, --force          overwrite the output file if it exists\n"
+        "  -k, --take-kicklayout  replace Kicklayout with the Amiga's copy if it\n"
+        "                       differs (by default Kicklayout is never replaced)\n"
         "  -l, --list           list the files offered by the Amiga and exit\n"
         "  -t, --timeout SECS   network timeout (default 15)\n"
         "  -V, --version        show version\n"
@@ -59,19 +110,15 @@ static void on_entry(const ksync_entry_report *rep, void *user)
     if (t->n == t->cap) {
         size_t ncap = t->cap ? t->cap * 2 : 32;
         row *nr = (row *)realloc(t->r, ncap * sizeof(row));
-        if (!nr) {
-            fprintf(stderr, PROGNAME ": out of memory\n");
-            exit(1);
-        }
+        if (!nr)
+            oom();
         t->r = nr;
         t->cap = ncap;
     }
     r = &t->r[t->n++];
     r->entry = (char *)malloc(strlen(rep->entry_name) + 1);
-    if (!r->entry) {
-        fprintf(stderr, PROGNAME ": out of memory\n");
-        exit(1);
-    }
+    if (!r->entry)
+        oom();
     strcpy(r->entry, rep->entry_name);
     ksync_format_version(&rep->zip_version, r->zipver, sizeof(r->zipver));
     if (rep->amiga_name)
@@ -83,16 +130,24 @@ static void on_entry(const ksync_entry_report *rep, void *user)
     case KSYNC_ACT_UPDATED:
         snprintf(r->result, sizeof(r->result), "UPDATED%s",
                  rep->reason == KSYNC_REASON_NO_AMIGA_VERSION ? " (no version on Amiga)" :
-                 rep->reason == KSYNC_REASON_NO_ZIP_VERSION   ? " (no version in zip)" : "");
+                 rep->reason == KSYNC_REASON_NO_ZIP_VERSION   ? " (no version in zip)" :
+                 rep->reason == KSYNC_REASON_TAKE_KICKLAYOUT  ? " (--take-kicklayout, see below)" : "");
         if (rep->renamed) {
             size_t l = strlen(r->result);
             snprintf(r->result + l, sizeof(r->result) - l, " (Amiga: %s, renamed)",
                      rep->amiga_name);
         }
+        if (rep->reason == KSYNC_REASON_TAKE_KICKLAYOUT)
+            layout_notes(t, rep);
         break;
     case KSYNC_ACT_SAME:
         snprintf(r->result, sizeof(r->result), "same%s",
+                 rep->identical    ? " (identical)" :
                  rep->size_differs ? " (size differs!)" : "");
+        break;
+    case KSYNC_ACT_KEPT_KICKLAYOUT:
+        snprintf(r->result, sizeof(r->result), "kept (Kicklayout differs, see below)");
+        layout_notes(t, rep);
         break;
     case KSYNC_ACT_KEPT_ZIP_NEWER:
         snprintf(r->result, sizeof(r->result), "kept (zip is newer)");
@@ -140,7 +195,7 @@ int main(int argc, char **argv)
     int port;
     ksync_options opt;
     ksync_result res;
-    rows table = { NULL, 0, 0 };
+    rows table = { NULL, 0, 0, NULL, 0 };
 
     ksync_options_init(&opt);
 
@@ -150,6 +205,8 @@ int main(int argc, char **argv)
             opt.dry_run = 1;
         } else if (strcmp(a, "-f") == 0 || strcmp(a, "--force") == 0) {
             opt.force = 1;
+        } else if (strcmp(a, "-k") == 0 || strcmp(a, "--take-kicklayout") == 0) {
+            opt.take_kicklayout = 1;
         } else if (strcmp(a, "-l") == 0 || strcmp(a, "--list") == 0) {
             list = 1;
         } else if (strcmp(a, "-t") == 0 || strcmp(a, "--timeout") == 0 ||
@@ -217,6 +274,10 @@ int main(int argc, char **argv)
             free(table.r[k].entry);
         }
         free(table.r);
+    }
+    if (table.notes) {
+        fputs(table.notes, stdout);
+        free(table.notes);
     }
 
     if (rc != KSYNC_OK) {

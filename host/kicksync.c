@@ -1306,6 +1306,125 @@ static void warn(const ksync_options *opt, const char *fmt, ...)
     opt->on_warning(msg, opt->user);
 }
 
+/* ====================================================================== */
+/* Kicklayout comparison                                                  */
+
+typedef struct strlist {
+    char  **s;
+    size_t  n, cap;
+} strlist;
+
+static void strlist_free(strlist *l)
+{
+    size_t i;
+    for (i = 0; i < l->n; i++)
+        free(l->s[i]);
+    free(l->s);
+    memset(l, 0, sizeof(*l));
+}
+
+static int strlist_has(const strlist *l, const char *s)
+{
+    size_t i;
+    for (i = 0; i < l->n; i++)
+        if (ksync_name_equal(l->s[i], s))
+            return 1;
+    return 0;
+}
+
+/* Adds a copy of s[0..len) unless it is already there (ignoring case). */
+static int strlist_add(strlist *l, const char *s, size_t len)
+{
+    char *c = (char *)malloc(len + 1);
+    if (!c)
+        return KSYNC_ERR_NOMEM;
+    memcpy(c, s, len);
+    c[len] = '\0';
+    if (strlist_has(l, c)) {
+        free(c);
+        return KSYNC_OK;
+    }
+    if (l->n == l->cap) {
+        size_t ncap = l->cap ? l->cap * 2 : 64;
+        char **ns = (char **)realloc(l->s, ncap * sizeof(*ns));
+        if (!ns) {
+            free(c);
+            return KSYNC_ERR_NOMEM;
+        }
+        l->s = ns;
+        l->cap = ncap;
+    }
+    l->s[l->n++] = c;
+    return KSYNC_OK;
+}
+
+static int is_blank(int c)
+{
+    return c == ' ' || c == '\t' || c == '\r';
+}
+
+/* The paths of all MODULE lines of a Kicklayout, in order, without
+   duplicates. Comment lines (";MODULE ...") don't start with MODULE and are
+   skipped that way. */
+static int layout_modules(const unsigned char *d, size_t len, strlist *out)
+{
+    static const char kw[] = "module";
+    size_t p = 0;
+
+    while (p < len) {
+        size_t e = p, q, t, k;
+        while (e < len && d[e] != '\n')
+            e++;
+        q = p;
+        while (q < e && is_blank(d[q]))
+            q++;
+        t = q;
+        while (t < e && !is_blank(d[t]))
+            t++;
+        if (t - q == sizeof(kw) - 1) {
+            for (k = 0; k < t - q && latin1_lower(d[q + k]) == kw[k]; k++)
+                ;
+            if (k == t - q) {
+                size_t a = t, b;
+                int r;
+                while (a < e && is_blank(d[a]))
+                    a++;
+                b = a;
+                while (b < e && !is_blank(d[b]) && d[b] != ';')
+                    b++;
+                if (b > a && (r = strlist_add(out, (const char *)d + a, b - a)) != KSYNC_OK)
+                    return r;
+            }
+        }
+        p = e + 1;
+    }
+    return KSYNC_OK;
+}
+
+/* Fills only_zip / only_amiga with the MODULE paths found in one copy only. */
+static int layout_diff(const unsigned char *zd, size_t zlen,
+                       const unsigned char *ad, size_t alen,
+                       strlist *only_zip, strlist *only_amiga)
+{
+    strlist zm = { NULL, 0, 0 }, am = { NULL, 0, 0 };
+    size_t i;
+    int r;
+
+    if ((r = layout_modules(zd, zlen, &zm)) != KSYNC_OK ||
+        (r = layout_modules(ad, alen, &am)) != KSYNC_OK)
+        goto out;
+    for (i = 0; i < zm.n && r == KSYNC_OK; i++)
+        if (!strlist_has(&am, zm.s[i]))
+            r = strlist_add(only_zip, zm.s[i], strlen(zm.s[i]));
+    for (i = 0; i < am.n && r == KSYNC_OK; i++)
+        if (!strlist_has(&zm, am.s[i]))
+            r = strlist_add(only_amiga, am.s[i], strlen(am.s[i]));
+out:
+    strlist_free(&zm);
+    strlist_free(&am);
+    return r;
+}
+
 int ksync_update_zip(const ksync_options *opt, ksync_result *res)
 {
     zarchive z;
@@ -1381,11 +1500,13 @@ int ksync_update_zip(const ksync_options *opt, ksync_result *res)
         oentry *o = &out[i];
         ksync_entry_report rep;
         ksync_file_info info;
-        unsigned char *data = NULL;
+        unsigned char *data = NULL, *blob = NULL;
+        size_t blen = 0;
         const char *name, *rname = NULL;
         char zipver[KSYNC_VER_MAX];
+        strlist only_zip = { NULL, 0, 0 }, only_amiga = { NULL, 0, 0 };
         size_t k;
-        int take = 0;
+        int take = 0, layout = 0;
 
         o->src = e;
         o->method = e->method;
@@ -1413,6 +1534,7 @@ int ksync_update_zip(const ksync_options *opt, ksync_result *res)
         ksync_parse_version(zipver, &rep.zip_version);
 
         name = base_name(e->name);
+        rep.is_kicklayout = ksync_name_equal(name, "Kicklayout");
         if (have_list) {
             for (k = 0; k < nremote; k++)
                 if (ksync_name_equal(remote[k].name, name)) {
@@ -1440,7 +1562,9 @@ int ksync_update_zip(const ksync_options *opt, ksync_result *res)
             ksync_parse_version(info.ver, &rep.amiga_version);
             cmp = ksync_compare_version(&rep.amiga_version, &rep.zip_version);
 
-            if (rep.amiga_version.n == 0) {
+            if (rep.is_kicklayout) {
+                layout = 1;          /* never by version: decided below */
+            } else if (rep.amiga_version.n == 0) {
                 take = 1;
                 rep.reason = KSYNC_REASON_NO_AMIGA_VERSION;
             } else if (rep.zip_version.n == 0) {
@@ -1456,44 +1580,80 @@ int ksync_update_zip(const ksync_options *opt, ksync_result *res)
                 rep.action = KSYNC_ACT_KEPT_ZIP_NEWER;
             }
         }
+
+        /* Download the Amiga copy when it goes into the zip, when it may be
+           identical to the zip copy (same size), or to compare Kicklayouts. */
+        if ((take || layout) && (layout || info.size == e->usize || !opt->dry_run)) {
+            char gotver[KSYNC_VER_MAX];
+            ksync_version gv;
+
+            r = ksync_get(conn, rname, &blob, &blen);
+            if (r != KSYNC_OK) {
+                set_err(err, errlen, "downloading %s: %s", rname, ksync_conn_error(conn));
+                if (r == KSYNC_NOT_FOUND)
+                    r = KSYNC_ERR_SERVER;
+                free(data);
+                goto done;
+            }
+            ksync_find_verstring(blob, blen, gotver, sizeof(gotver));
+            ksync_parse_version(gotver, &gv);
+            if (ksync_compare_version(&gv, &rep.amiga_version) != 0) {
+                set_err(err, errlen, "%s changed on the Amiga while downloading", rname);
+                r = KSYNC_ERR_PROTOCOL;
+                free(blob);
+                free(data);
+                goto done;
+            }
+            if (blen == e->usize && memcmp(blob, data, blen) == 0) {
+                take = layout = 0;
+                rep.action = KSYNC_ACT_SAME;
+                rep.reason = KSYNC_REASON_NONE;
+                rep.identical = 1;
+            } else if (layout) {
+                r = layout_diff(data, e->usize, blob, blen, &only_zip, &only_amiga);
+                if (r != KSYNC_OK) {
+                    set_err(err, errlen, "out of memory");
+                    free(blob);
+                    free(data);
+                    strlist_free(&only_zip);
+                    strlist_free(&only_amiga);
+                    goto done;
+                }
+                rep.layout_only_zip = (const char *const *)only_zip.s;
+                rep.layout_only_zip_count = only_zip.n;
+                rep.layout_only_amiga = (const char *const *)only_amiga.s;
+                rep.layout_only_amiga_count = only_amiga.n;
+                if (opt->take_kicklayout) {
+                    take = 1;
+                    rep.reason = KSYNC_REASON_TAKE_KICKLAYOUT;
+                } else {
+                    rep.action = KSYNC_ACT_KEPT_KICKLAYOUT;
+                }
+            }
+        }
         free(data);
 
         if (take) {
             rep.action = KSYNC_ACT_UPDATED;
             res->updated++;
             if (!opt->dry_run) {
-                unsigned char *blob;
-                size_t blen;
-                char gotver[KSYNC_VER_MAX];
-                ksync_version gv;
-
-                r = ksync_get(conn, rname, &blob, &blen);
-                if (r != KSYNC_OK) {
-                    set_err(err, errlen, "downloading %s: %s", rname, ksync_conn_error(conn));
-                    if (r == KSYNC_NOT_FOUND)
-                        r = KSYNC_ERR_SERVER;
-                    goto done;
-                }
-                ksync_find_verstring(blob, blen, gotver, sizeof(gotver));
-                ksync_parse_version(gotver, &gv);
-                if (ksync_compare_version(&gv, &rep.amiga_version) != 0) {
-                    set_err(err, errlen, "%s changed on the Amiga while downloading", rname);
-                    free(blob);
-                    r = KSYNC_ERR_PROTOCOL;
-                    goto done;
-                }
                 r = compress_entry(o, blob, blen);
-                free(blob);
                 if (r != KSYNC_OK) {
                     set_err(err, errlen, "compressing %s failed", e->name);
+                    free(blob);
+                    strlist_free(&only_zip);
+                    strlist_free(&only_amiga);
                     goto done;
                 }
                 o->replaced = 1;     /* name stays e->name: the zip's spelling */
                 amiga_to_dos(info.date, &o->dtime, &o->ddate);
             }
         }
+        free(blob);
         if (opt->on_entry)
             opt->on_entry(&rep, opt->user);
+        strlist_free(&only_zip);
+        strlist_free(&only_amiga);
     }
 
     if (opt->dry_run)

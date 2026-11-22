@@ -74,14 +74,26 @@ Usage:
   uses the spelling from the original zip; a downloaded file with different
   case is renamed and reported as `(Amiga: <name>, renamed)`.
 * The Amiga copy is taken **unless** both copies have a `$VER:` version and
-  the Amiga one is not newer. So a file without `$VER:` on either side (such
-  as `Kicklayout`) is always taken from the Amiga.
+  the Amiga one is not newer. So a file without `$VER:` on either side is
+  taken from the Amiga, unless it is byte for byte the same as the zip copy:
+  then it is reported as `same (identical)` and not counted as updated
+  (when the sizes match, KickSync downloads the file to compare, also with
+  `--dry-run`).
+* `Kicklayout` is **never replaced**, whatever its `$VER:` says. It lists
+  the modules for one particular machine: the one in a `Kickstart.zip` for
+  QEMU loads `siliconmotion502.chip` for the emulated SM501 graphics, for
+  example, while `SYS:Kickstart/Kicklayout` on the Amiga may be meant for
+  other hardware. If the two copies differ, KickSync keeps the zip's copy
+  and lists the `MODULE` lines found in only one of them (ignoring
+  upper/lower case and `;` comment lines), so you can merge by hand.
+  `-k/--take-kicklayout` takes the Amiga's copy instead.
 * Unchanged entries are copied byte for byte, in the original order.
 * Modules that exist only on the Amiga are not added. If an update installed
-  new modules, check `Kicklayout` and add them yourself.
+  new modules, the Kicklayout notes show the new `MODULE` lines; add the
+  modules to the zip and to its Kicklayout yourself.
 
 Options: `-n/--dry-run` (just show the table), `-l/--list` (list what the
-server offers), `-f/--force`, `-t/--timeout SECONDS`.
+server offers), `-f/--force`, `-k/--take-kicklayout`, `-t/--timeout SECONDS`.
 
 Example output:
 
@@ -92,7 +104,14 @@ Kickstart/EXEC.library.kmod  54.10      54.9       kept (zip is newer)
 Kickstart/dos.library.kmod   54.100     54.100     same
 Kickstart/only.zip.kmod      1.0        -          kept (not on Amiga)
 Kickstart/nover.zip.kmod     ?          2.1        UPDATED (no version in zip)
-Kickstart/Kicklayout         ?          ?          UPDATED (no version on Amiga)
+Kickstart/diskboot.kmod      ?          ?          same (identical)
+Kickstart/Kicklayout         53.3       53.3       kept (Kicklayout differs, see below)
+
+Kickstart/Kicklayout: the Amiga's copy (Kicklayout) differs; the zip's copy was kept.
+  only in the zip's copy:    MODULE Kickstart/siliconmotion502.chip
+  Merge by hand if needed, or use --take-kicklayout to take the Amiga's copy.
+
+2 module(s) updated, written to Kickstart_2026-11-22.zip
 ```
 
 ### Using the library in your own program
