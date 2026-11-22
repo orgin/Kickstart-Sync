@@ -168,5 +168,5 @@ Plain text lines, fields separated by TAB, lines end with LF.
 
 ## License
 
-Kickstart Sync is not an open source project. All rights reserved; no
-license is granted to copy, modify or redistribute this software.
+Kickstart Sync is free and unencumbered software released into the public
+domain ([Unlicense](https://unlicense.org/)); see [LICENSE](LICENSE).
