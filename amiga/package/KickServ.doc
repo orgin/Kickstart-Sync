@@ -1,0 +1,96 @@
+KickServ @VERSION@ (@DATE@)
+===========================
+
+KickServ is an AmigaOS 4 commodity without a window. It serves the
+Kickstart modules in SYS:Kickstart over TCP/IP, so that KickSync, a
+program on another computer, can update the Kickstart.zip that AmigaOS 4
+under QEMU (with BBoot) boots from:
+
+  KickSync (Linux, macOS, Windows)        KickServ (AmigaOS 4)
+    reads Kickstart.zip         --TCP-->    serves SYS:Kickstart
+    asks for the version of every module    reports size, date, $VER
+    downloads the newer ones                sends the file
+    writes Kickstart_<date>.zip
+
+Source, KickSync and the protocol: https://github.com/orgin/Kickstart-Sync
+
+
+Installation
+------------
+
+Double-click Install. It copies KickServ and its icon to
+SYS:Utilities/Commodities and this text to SYS:Documentation, and asks
+whether KickServ should start when the computer starts (it is then added
+to the WBStartup preferences, Prefs/WBStartup) and whether to start it now.
+
+An existing KickServ icon is kept, with its tool types.
+
+
+Starting and stopping
+---------------------
+
+Double-click KickServ, or start it from a Shell. It appears in Exchange:
+
+  Disable   stops listening (the TCP port is freed)
+  Enable    listens again
+  Remove    quits KickServ
+
+Ctrl-C quits it too when it was started from a Shell. Starting it a second
+time does nothing.
+
+
+Tool types and Shell arguments
+------------------------------
+
+  PORT=<n>          TCP port to listen on                 (default 6800)
+  DIR=<path>        drawer whose files are served      (default SYS:Kickstart)
+  ALLOW=<list>      comma separated addresses or networks that may
+                    connect, e.g. 10.0.2.2 or 192.168.1.0/24; ANY allows
+                    everybody                                (default ANY)
+  CX_PRIORITY=<n>   commodity priority                       (default 0)
+  QUIET             no log output when started from a Shell
+
+The icon has them switched off with brackets, e.g. (PORT=6800): remove
+the brackets to use one. From a Shell the same keywords work as arguments
+(KickServ PORT=7000) and override the icon.
+
+Only plain file names inside DIR are served: names with ":", a leading
+"/" or "//" are refused, so nothing outside that drawer can be read.
+KickServ has no password, so use ALLOW if the computer can be reached
+from a network you don't trust.
+
+
+Using it with QEMU
+------------------
+
+With QEMU's user networking, forward a port of the host computer to the
+guest, for example:
+
+  qemu-system-ppc ... -nic user,model=rtl8139,hostfwd=tcp:127.0.0.1:6800-:6800
+
+(or add hostfwd=tcp:127.0.0.1:6800-:6800 to an existing -netdev user,...).
+Connections then come from 10.0.2.2 inside the guest, so ALLOW=10.0.2.2
+lets only the host in. On the host:
+
+  KickSync localhost:6800 Kickstart.zip
+
+shows what is newer on the Amiga and writes Kickstart_<YYYY-MM-DD>.zip;
+the original zip is never changed. KickSync -n only shows the list, and
+KickSync --list localhost:6800 lists what KickServ offers.
+
+KickSync never replaces Kicklayout, which belongs to one particular
+machine: when the Amiga's copy differs, it lists the MODULE lines found in
+only one of the two copies, so you can merge them by hand.
+
+
+History
+-------
+
+1.0 (21.11.2026)  first release
+
+
+Licence
+-------
+
+Kickstart Sync is free and unencumbered software released into the public
+domain (Unlicense, https://unlicense.org/).

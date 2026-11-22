@@ -1,0 +1,140 @@
+; Install script for KickServ (AmigaOS 4 Installation Utility).
+;
+; Copies KickServ (+ icon) to SYS:Utilities/Commodities and KickServ.doc to
+; the documentation drawer, can add KickServ to the WBStartup preferences so
+; that it starts with Workbench, and can start it at once.
+;
+; Install.wbstartup is one ENVARC:Sys/wbstartup.prefs entry for
+; SYS:Utilities/Commodities/KickServ, Install.wbsheader the header of a new
+; wbstartup.prefs. The Installer can't write binary files, so they are
+; joined with C:Join.
+
+(set #app "KickServ")
+(set @app-name "KickServ")
+(set @default-dest "SYS:Utilities/Commodities")
+; the log Novice mode writes goes to T: (LOGFILE tooltype of the icon)
+
+(set #cxdir @default-dest)
+(set #prog (tackon #cxdir "KickServ"))
+(set #wbsprefs "ENVARC:Sys/wbstartup.prefs")
+
+(welcome
+  (cat "This installs KickServ, a commodity that serves the Kickstart modules "
+       "in SYS:Kickstart over TCP/IP.\n\n"
+       "KickSync on another computer uses it to update the Kickstart.zip that "
+       "AmigaOS 4 under QEMU boots from."))
+
+(if (= (expandpath #cxdir) (expandpath ""))
+  (abort "Start Install from the unpacked archive, not from " #cxdir ".")
+)
+
+; --- the commodity ------------------------------------------------------
+
+(set #update (exists #prog))
+(set #oldicon (exists (cat #prog ".info")))
+
+; copylib keeps a newer KickServ that is installed already
+(copylib
+  (prompt (cat "Copying KickServ to " #cxdir))
+  (help @copylib-help)
+  (source "KickServ")
+  (dest #cxdir)
+  (confirm "expert"))
+
+; an existing icon keeps its tool types (PORT, DIR, ALLOW ...)
+(if (not #oldicon)
+  (copyfiles
+    (prompt "Copying the KickServ icon")
+    (help @copyfiles-help)
+    (source "KickServ.info")
+    (dest #cxdir)
+    (nogauge))
+)
+
+; --- documentation ------------------------------------------------------
+
+(set #docdir "SYS:Documentation/Commodities")
+(if (not (exists #docdir))
+  (set #docdir "SYS:Documentation")
+)
+(if (exists #docdir)
+  (copyfiles
+    (prompt "Copying the documentation")
+    (help @copyfiles-help)
+    (source "KickServ.doc")
+    (dest #docdir)
+    (nogauge))
+)
+
+; --- start with Workbench -------------------------------------------------
+
+; A copy in SYS:WBStartup (manual install) is left alone: adding the prefs
+; entry too would start KickServ twice (the second one quits at once, but
+; the copy would not be updated).
+(set #wbcopy (exists "SYS:WBStartup/KickServ"))
+(set #inprefs 0)
+(if (exists #wbsprefs)
+  (set #inprefs (= 0 (run (cat "C:Search >NIL: " #wbsprefs " Commodities/KickServ QUIET"))))
+)
+
+(set #autostart (or #wbcopy #inprefs))
+(if (not #autostart)
+  (set #autostart
+    (askbool
+      (prompt "Start KickServ when the computer starts?\n\n"
+              "It is added to the WBStartup preferences (Prefs/WBStartup), "
+              "where you can switch it off again.")
+      (help @askbool-help)
+      (default 1)))
+)
+
+(if (and #autostart (not #wbcopy) (not #inprefs))
+  (
+    (if (exists #wbsprefs)
+      (run (cat "C:Join " #wbsprefs " Install.wbstartup AS T:kickserv-wbstartup.prefs"))
+      (run "C:Join Install.wbsheader Install.wbstartup AS T:kickserv-wbstartup.prefs")
+    )
+    (if (exists "T:kickserv-wbstartup.prefs")
+      (
+        (copyfiles
+          (prompt "Adding KickServ to the WBStartup preferences")
+          (help @copyfiles-help)
+          (source "T:kickserv-wbstartup.prefs")
+          (dest "ENVARC:Sys")
+          (newname "wbstartup.prefs")
+          (nogauge))
+        (copyfiles
+          (prompt "Adding KickServ to the WBStartup preferences")
+          (help @copyfiles-help)
+          (source "T:kickserv-wbstartup.prefs")
+          (dest "ENV:Sys")
+          (newname "wbstartup.prefs")
+          (nogauge))
+        (delete "T:kickserv-wbstartup.prefs" (optional "force"))
+      )
+    )
+  )
+)
+
+; --- start it now -----------------------------------------------------------
+
+(set #notes "")
+(if #update
+  (set #notes (cat "\n\nIf an older KickServ is running, it keeps running: "
+                   "remove it in Exchange and start KickServ again (or restart "
+                   "the computer) to use the new one."))
+)
+
+(if (askbool
+      (prompt "Start KickServ now?")
+      (help @askbool-help)
+      (default 1))
+  (run (cat "C:WBRun " #prog))
+)
+
+(exit (cat "KickServ is installed in " #cxdir ". It listens on TCP port 6800 "
+           "and appears in Exchange; its tool types set the port, the drawer "
+           "it serves and the computers allowed to connect.\n\n"
+           "Read " (tackon #docdir "KickServ.doc") " for KickSync and the QEMU "
+           "port forward." #notes)
+      (quiet))

@@ -16,15 +16,27 @@ BBoot) with the newest Kickstart modules from the running AmigaOS 4 guest.
 
 ## AmigaOS side: `amiga/KickServ`
 
+Install it from the release archive `KickServ.lha`: unpack it and
+double-click `KickServ/Install`. The installer copies KickServ with its icon
+to `SYS:Utilities/Commodities` and `KickServ.doc` to `SYS:Documentation`,
+can add KickServ to the WBStartup preferences (on AmigaOS 4.1 Final Edition
+programs started with Workbench are listed in `ENVARC:Sys/wbstartup.prefs`,
+edited with Prefs/WBStartup), and can start it at once. An existing
+KickServ icon keeps its tool types.
+
 Build (needs the OS4 cross compiler, or Docker):
 
     cd amiga
     make            # with ppc-amigaos-gcc in PATH
-    make docker     # or: uses walkero/amigagccondocker:os4-gcc11
+    make docker     # or: uses walkero/amigagccondocker:os4-gcc15-3.7.0
 
-Copy `KickServ` to e.g. `SYS:Utilities/Commodities/` and give it a tool icon
-(copy any other commodity's icon to `KickServ.info`). To start it at boot,
-put it in `SYS:WBStartup/` (add the `DONOTWAIT` tool type).
+| File | Purpose |
+|------|---------|
+| `kickserv.c` | The commodity. |
+| `KickServ` | The release build (stripped). |
+| `package/Install` | Installation Utility script. |
+| `package/KickServ.doc` | User documentation (in the archive and in `SYS:Documentation`). |
+| `package/icons/` | Release icons, saved by icon.library; see its README. |
 
 | Tool type / CLI argument | Default         | Meaning |
 |--------------------------|-----------------|---------|
@@ -150,6 +162,24 @@ With tap/bridged networking, use the guest's IP address directly.
 
 `host/kickserv_mock.py DIR [PORT]` serves a local directory using the same
 protocol, so you can try KickSync without an Amiga (`make test` uses it).
+
+## Releases
+
+    tools/make_lha.sh
+
+builds both release files into `dist/`:
+
+* `KickServ.lha`: the AmigaOS 4 archive with the installer. KickServ is
+  built with the `walkero/amigagccondocker:os4-gcc15-3.7.0` Docker image
+  (`DOCKER="docker"` if your user may run Docker without sudo) and packed
+  with LHa for UNIX (`LHA=/path/to/lha`).
+* `KickSync-<version>-linux-x86_64`: a fully static KickSync (musl + zlib)
+  that runs on any x86_64 Linux. `tools/build_linux_static.sh` builds it on
+  its own; it needs `musl-gcc` (Debian/Ubuntu: `apt install musl-tools`)
+  and downloads zlib once, checked against its SHA-256.
+
+Both files are also copied to `$RELEASES` if that directory exists (the
+default is the maintainer's releases folder; set `RELEASES` to your own).
 
 ## Protocol
 

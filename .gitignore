@@ -4,3 +4,5 @@
 *.o
 *.kstmp
 __pycache__/
+/build/
+/dist/
